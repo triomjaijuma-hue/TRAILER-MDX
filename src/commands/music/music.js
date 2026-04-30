@@ -7,37 +7,41 @@ const path = require('path');
 const helpers = require('../../lib/helpers');
 const config = require('../../lib/config');
 
-// WhatsApp's media upload practical ceiling is ~16 MB for inline audio/video.
-// Hard-cap to be safe and tell the user to use the link instead when over.
 const MAX_MEDIA_BYTES = 14 * 1024 * 1024;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// --- 2026 provider chain ------------------------------------------------
-//
-// The classic stack (`ytdl-core`, `@distube/ytdl-core`, `cobalt.tools`) is
-// effectively dead in 2026: ytdl-core needs PoToken/visitorData, cobalt
-// closed its public API behind Turnstile, and most community wrapper APIs
-// (giftedtech, princetechn, davidcyril, dreaded, nyxs, savetube, ...) are
-// either offline, rate-locked, or return "Failed to fetch video information".
-//
-// The ONLY reliable path on a server in 2026 is yt-dlp running locally.
-// The Dockerfile / nixpacks already install it. We try the local binary
-// first; if it isn't on PATH for some reason, we fall through to whatever
-// wrapper APIs still respond — better than nothing.
+// --- yt-dlp binary -------------------------------------------------------
+// Dockerfile/nixpacks installs yt-dlp system-wide. The postinstall script
+// also downloads it to ./bin/yt-dlp so it works on platforms that don't
+// build from our Dockerfile (Railway nixpacks, raw VPS, etc.).
+const _BIN_PATHS = [
+  process.env.YTDLP_BIN,
+  path.join(__dirname, '../../../bin/yt-dlp'),
+  'yt-dlp',
+].filter(Boolean);
 
-const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
-let ytdlpAvailable = null; // lazy probe
+let ytdlpBin = null;
+let ytdlpAvailable = null;
 function probeYtdlp() {
   if (ytdlpAvailable !== null) return Promise.resolve(ytdlpAvailable);
   return new Promise((resolve) => {
-    execFile(YTDLP_BIN, ['--version'], { timeout: 5000 }, (err) => {
-      ytdlpAvailable = !err;
-      resolve(ytdlpAvailable);
-    });
+    let tried = 0;
+    const tryNext = () => {
+      if (tried >= _BIN_PATHS.length) {
+        ytdlpAvailable = false;
+        return resolve(false);
+      }
+      const bin = _BIN_PATHS[tried++];
+      execFile(bin, ['--version'], { timeout: 5000 }, (err) => {
+        if (!err) { ytdlpBin = bin; ytdlpAvailable = true; return resolve(true); }
+        tryNext();
+      });
+    };
+    tryNext();
   });
 }
 
-function ytdlpDownload(url, kind /* 'audio' | 'video' */) {
+function ytdlpDownload(url, kind) {
   return new Promise((resolve, reject) => {
     helpers.ensureTmp();
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -57,7 +61,7 @@ function ytdlpDownload(url, kind /* 'audio' | 'video' */) {
       '-o', out,
       url,
     ];
-    execFile(YTDLP_BIN, args, { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }, (err, _so, se) => {
+    execFile(ytdlpBin || 'yt-dlp', args, { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }, (err, _so, se) => {
       if (err) {
         try { fs.unlinkSync(out); } catch (_) {}
         const msg = (se || err.message || '').toString().split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 300);
@@ -68,16 +72,60 @@ function ytdlpDownload(url, kind /* 'audio' | 'video' */) {
         fs.unlinkSync(out);
         if (buf.length < 2048) return reject(new Error('yt-dlp output too small'));
         resolve(buf);
-      } catch (e) {
-        reject(e);
-      }
+      } catch (e) { reject(e); }
     });
   });
 }
 
-// Each provider exposes:
-//   build(url): the GET endpoint to hit
-//   pick(data): pulls the direct media URL out of the JSON response
+// --- @distube/ytdl-core (already in package.json) -----------------------
+// Load lazily so a missing package doesn't crash the whole bot.
+let _ytdl;
+function getYtdl() {
+  if (_ytdl !== undefined) return _ytdl;
+  try { _ytdl = require('@distube/ytdl-core'); }
+  catch (_) { try { _ytdl = require('ytdl-core'); } catch (__) { _ytdl = null; } }
+  return _ytdl;
+}
+
+async function ytdlCoreDownload(url, kind) {
+  const ytdl = getYtdl();
+  if (!ytdl) throw new Error('ytdl-core not available');
+
+  // getBasicInfo is lighter and avoids heavy signature decryption
+  const info = await ytdl.getInfo(url, {
+    requestOptions: { headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' } },
+  });
+
+  let format;
+  if (kind === 'audio') {
+    // Prefer m4a/mp4a for direct download (already muxed, no ffmpeg needed)
+    format = info.formats
+      .filter(f => f.hasAudio && !f.hasVideo && (f.container === 'm4a' || f.mimeType?.includes('audio/mp4')))
+      .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+    if (!format) format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
+  } else {
+    // Combined mp4 ≤ 480 p — avoids needing ffmpeg to mux
+    format = info.formats
+      .filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4' && (f.height || 720) <= 480)
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    if (!format) format = ytdl.chooseFormat(info.formats, { quality: '480p', filter: 'videoandaudio' });
+    if (!format) format = ytdl.chooseFormat(info.formats, { filter: 'videoandaudio' });
+  }
+  if (!format?.url) throw new Error('no suitable ytdl-core format');
+
+  const r = await axios.get(format.url, {
+    responseType: 'arraybuffer',
+    timeout: 90000,
+    maxContentLength: MAX_MEDIA_BYTES,
+    maxBodyLength: MAX_MEDIA_BYTES,
+    headers: { 'User-Agent': UA, ...(format.requestHeaders || {}) },
+  });
+  const buf = Buffer.from(r.data);
+  if (buf.length < 2048) throw new Error('ytdl-core stream too small');
+  return buf;
+}
+
+// --- API provider fallbacks (mostly dead in 2026, best-effort) ----------
 const AUDIO_PROVIDERS = [
   {
     name: 'cobalt',
@@ -118,7 +166,6 @@ const VIDEO_PROVIDERS = [
   },
 ];
 
-// Hit a provider, follow its JSON shape, and return the resolved download URL.
 async function resolveDirectUrl(providers, ytUrl) {
   const errors = [];
   for (const p of providers) {
@@ -142,7 +189,6 @@ async function resolveDirectUrl(providers, ytUrl) {
   throw new Error(errors.join(' | ') || 'no provider responded');
 }
 
-// Stream a remote URL into a buffer with a hard size cap so we don't OOM.
 async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
   const r = await axios.get(url, {
     responseType: 'arraybuffer',
@@ -156,32 +202,39 @@ async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
   return buf;
 }
 
-// Top-level: try local yt-dlp first, then fall back to wrapper APIs.
-async function fetchYouTubeMedia(url, kind /* 'audio' | 'video' */) {
+// --- Main download function: yt-dlp → @distube/ytdl-core → API wrappers -
+async function fetchYouTubeMedia(url, kind) {
+  const errors = [];
+
+  // 1. yt-dlp (most reliable in 2026 — needs binary in PATH or ./bin/)
   if (await probeYtdlp()) {
     try {
       const buf = await ytdlpDownload(url, kind);
       return { buf, source: 'yt-dlp' };
-    } catch (e) {
-      // fall through to API providers
-      var ytdlpErr = e.message;
-    }
+    } catch (e) { errors.push(`yt-dlp: ${e.message}`); }
+  } else {
+    errors.push('yt-dlp: not installed');
   }
+
+  // 2. @distube/ytdl-core (already in package.json, no binary needed)
+  try {
+    const buf = await ytdlCoreDownload(url, kind);
+    return { buf, source: 'ytdl-core' };
+  } catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 120)}`); }
+
+  // 3. Community wrapper APIs (best-effort, mostly dead in 2026)
   const providers = kind === 'audio' ? AUDIO_PROVIDERS : VIDEO_PROVIDERS;
   try {
     const { direct, source } = await resolveDirectUrl(providers, url);
     const buf = await downloadCapped(direct);
     return { buf, source };
-  } catch (e) {
-    const reason = ytdlpErr ? `yt-dlp: ${ytdlpErr} | ${e.message}` : e.message;
-    throw new Error(reason);
-  }
+  } catch (e) { errors.push(e.message); }
+
+  throw new Error(errors.join(' | '));
 }
 
-// --- search -------------------------------------------------------------
+// --- Search --------------------------------------------------------------
 
-// Pick the result that best matches the query, instead of blindly
-// taking the first hit (which is often a remix / cover / reaction).
 async function search(q) {
   const r = await ytSearchSafe(q);
   const vids = r?.videos || [];
@@ -208,28 +261,15 @@ async function search(q) {
     return score;
   };
 
-  const ranked = vids.slice(0, 15)
+  return vids.slice(0, 15)
     .map(v => ({ v, s: scoreOf(v) }))
-    .sort((a, b) => b.s - a.s);
-  return ranked[0]?.v || vids[0];
+    .sort((a, b) => b.s - a.s)[0]?.v || vids[0];
 }
 
-// yt-search occasionally throws after YouTube tweaks its initialData
-// payload. Wrap it and fall back to scraping the search results page so
-// .ytsearch / .play don't dead-end on a TypeError. As a final fallback
-// we use Piped/Invidious public mirrors which expose a stable JSON API.
 async function ytSearchSafe(query) {
-  try {
-    const r = await yts(query);
-    if (r?.videos?.length) return r;
-  } catch (_) {}
-  try {
-    const r = await ytSearchScrape(query);
-    if (r?.videos?.length) return r;
-  } catch (_) {}
-  try {
-    return await ytSearchPiped(query);
-  } catch (_) {}
+  try { const r = await yts(query); if (r?.videos?.length) return r; } catch (_) {}
+  try { const r = await ytSearchScrape(query); if (r?.videos?.length) return r; } catch (_) {}
+  try { return await ytSearchPiped(query); } catch (_) {}
   return { videos: [] };
 }
 
@@ -238,8 +278,6 @@ async function ytSearchScrape(query) {
     `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
     { timeout: 15000, headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' } },
   );
-  // Anchor on the closing `;</script>` so we capture the full nested JSON
-  // instead of stopping at the first `}` (the old non-greedy regex did).
   const m = html.match(/var ytInitialData = (\{[\s\S]+?\});\s*<\/script>/);
   if (!m) return { videos: [] };
   let data;
@@ -317,18 +355,13 @@ function secsToStamp(s) {
   return `${m}:${String(sec).padStart(2, '0')}`;
 }
 
-// --- lyrics -------------------------------------------------------------
-//
-// lrclib.net is a community-maintained karaoke-lyrics database with a free
-// no-key API and is the most reliable option in 2026. We start with the
-// search endpoint (works for loose queries) and fall back to /get for
-// "artist - title" style queries, then lyrics.ovh as last resort.
+// --- Lyrics -------------------------------------------------------------
+
 async function fetchLyrics(query) {
   const parts = query.split(/\s*-\s*/);
   const artist = parts.length > 1 ? (parts[0] || '').trim() : '';
   const song   = (parts.length > 1 ? parts.slice(1).join(' - ') : query).trim();
 
-  // 1) lrclib search — handles loose queries like "shape of you"
   try {
     const data = await helpers.getJson(
       `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
@@ -339,7 +372,6 @@ async function fetchLyrics(query) {
     if (text) return { text, title: hit ? `${hit.artistName} — ${hit.trackName}` : null };
   } catch (_) {}
 
-  // 2) lrclib direct lookup — only when we have explicit artist + song
   if (artist && song) {
     try {
       const data = await helpers.getJson(
@@ -351,7 +383,6 @@ async function fetchLyrics(query) {
     } catch (_) {}
   }
 
-  // 3) lyrics.ovh
   if (artist && song && artist !== song) {
     try {
       const data = await helpers.getJson(
@@ -362,7 +393,6 @@ async function fetchLyrics(query) {
     } catch (_) {}
   }
 
-  // 4) some-random-api
   try {
     const data = await helpers.getJson(
       `https://some-random-api.com/lyrics?title=${encodeURIComponent(query)}`,
@@ -379,7 +409,7 @@ function stripLrcTimestamps(s) {
   return s.replace(/\[\d{2}:\d{2}(?:\.\d{1,3})?\]\s?/g, '').trim();
 }
 
-// --- commands -----------------------------------------------------------
+// --- Commands -----------------------------------------------------------
 module.exports = [
   {
     name: 'ytsearch', aliases: ['ysearch'],
@@ -390,7 +420,7 @@ module.exports = [
         const r = await ytSearchSafe(argText);
         const top = (r?.videos || []).slice(0, 6);
         if (!top.length) return reply('Nothing found.');
-        reply(top.map(v => `• ${v.title}\n  ${v.timestamp || (v.duration?.timestamp || '')} · ${v.author?.name || ''}\n  ${v.url}`).join('\n\n'));
+        reply(top.map(v => `• ${v.title}\n  ${v.timestamp || v.duration?.timestamp || ''} · ${v.author?.name || ''}\n  ${v.url}`).join('\n\n'));
       } catch (e) {
         reply(`YouTube search failed: ${e?.message?.slice(0, 200) || 'unknown'}`);
       }
@@ -430,7 +460,7 @@ module.exports = [
         const { buf, source } = await fetchYouTubeMedia(v.url, 'video');
         await sock.sendMessage(jid, { video: buf, mimetype: 'video/mp4', caption: `${v.title}\n_via ${source}_` }, { quoted: m });
       } catch (e) {
-        reply(`❌ Video download failed.\n*${v.title}*\n${v.url}\n_${e.message?.slice(0, 250)}_\n\n_Long videos may exceed WhatsApp's 14 MB limit — try .play ${argText} for audio only._`);
+        reply(`❌ Video download failed.\n*${v.title}*\n${v.url}\n_${e.message?.slice(0, 250)}_\n\n_Try .play ${argText} for audio only._`);
       }
     },
   },
@@ -440,7 +470,7 @@ module.exports = [
       if (!argText) return reply('Usage: .lyrics <song name>  or  .lyrics <artist> - <song>');
       try {
         const result = await fetchLyrics(argText);
-        if (!result) return reply('No lyrics found. Try a more specific query like `.lyrics <artist> - <song>`.');
+        if (!result) return reply('No lyrics found. Try `.lyrics <artist> - <song>`.');
         const header = result.title ? `🎤 *${result.title}*\n\n` : '';
         const body = result.text.length > 3500 ? result.text.slice(0, 3500) + '\n\n_…truncated_' : result.text;
         reply(header + body);
