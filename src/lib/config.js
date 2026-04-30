@@ -14,8 +14,12 @@ const config = {
   webUsername: process.env.WEB_USERNAME || '',
   webPassword: process.env.WEB_PASSWORD || '',
 
-  openaiKey: process.env.OPENAI_API_KEY || '',
+  // Order of preference for chat: Gemini > Groq > OpenRouter > OpenAI
+  // Gemini and Groq are 100% free (no credit card). OpenRouter has free models too.
+  geminiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '',
+  groqKey: process.env.GROQ_API_KEY || '',
   openrouterKey: process.env.OPENROUTER_API_KEY || '',
+  openaiKey: process.env.OPENAI_API_KEY || '',
 
   paths: {
     auth: path.resolve(__dirname, '..', '..', 'auth_info'),

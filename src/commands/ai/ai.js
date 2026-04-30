@@ -62,6 +62,30 @@ module.exports = [
     },
   },
   {
+    name: 'aiprovider', aliases: ['aistatus'],
+    description: 'Show which AI provider the bot is currently using',
+    handler: async ({ reply }) => {
+      const p = ai.activeProvider();
+      if (!p) {
+        return reply(
+          '🤖 *No AI provider configured.*\n\n' +
+          '👉 Recommended FREE options (no credit card):\n' +
+          '• Google Gemini — https://aistudio.google.com/app/apikey\n' +
+          '   then set *GEMINI_API_KEY* in your environment\n' +
+          '• Groq (fast Llama) — https://console.groq.com/keys\n' +
+          '   then set *GROQ_API_KEY*'
+        );
+      }
+      const labels = {
+        gemini: 'Google Gemini (free)',
+        groq: 'Groq Llama (free)',
+        openrouter: 'OpenRouter',
+        openai: 'OpenAI',
+      };
+      reply(`🤖 Active AI provider: *${labels[p] || p}*\n\nFallback chain order: GEMINI → GROQ → OPENROUTER → OPENAI`);
+    },
+  },
+  {
     name: 'aionall',
     description: 'Turn AI auto-reply ON for ALL DMs (global)',
     owner: true,
