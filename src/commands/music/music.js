@@ -67,20 +67,23 @@ async function fetchAudio(url) {
     if (buf.length > 1024) return { buf, source: 'ytdl-core' };
   } catch (e) { errors.push(`ytdl: ${e.message}`); }
 
-  // Strategy 3: Cobalt public API (no key required)
-  try {
-    const r = await axios.post(
-      'https://api.cobalt.tools/api/json',
-      { url, isAudioOnly: true, aFormat: 'mp3' },
-      { timeout: 30000, headers: { Accept: 'application/json', 'Content-Type': 'application/json' } }
-    );
-    const direct = r.data?.url || r.data?.audio;
-    if (direct) {
-      const audio = await axios.get(direct, { responseType: 'arraybuffer', timeout: 60000 });
-      const buf = Buffer.from(audio.data);
-      if (buf.length > 1024) return { buf, source: 'cobalt' };
-    }
-  } catch (e) { errors.push(`cobalt: ${e.message}`); }
+  // Strategy 3: Cobalt v10 public API (no key required) with multi-instance fallback.
+  const cobaltInstances = ['https://api.cobalt.tools', 'https://co.wuk.sh', 'https://capi.oak.li'];
+  for (const base of cobaltInstances) {
+    try {
+      const r = await axios.post(
+        `${base}/`,
+        { url, downloadMode: 'audio', audioFormat: 'mp3' },
+        { timeout: 30000, headers: { Accept: 'application/json', 'Content-Type': 'application/json' } }
+      );
+      const direct = r.data?.url || r.data?.audio;
+      if (direct) {
+        const audio = await axios.get(direct, { responseType: 'arraybuffer', timeout: 60000 });
+        const buf = Buffer.from(audio.data);
+        if (buf.length > 1024) return { buf, source: `cobalt(${base.replace('https://', '')})` };
+      }
+    } catch (e) { errors.push(`cobalt(${base}): ${e.message}`); }
+  }
 
   throw new Error(errors.join(' | ') || 'no working audio source');
 }
