@@ -18,21 +18,38 @@ function ffmpeg(args) {
   });
 }
 
-// Build a "fake" full message object from the quoted message so Baileys'
-// downloadMediaMessage has the .key (id, remoteJid, participant) it needs
-// to decrypt. The previous `{ message: inner }` shape was missing the key
-// entirely, which silently failed for many media types in current Baileys.
+// Extract contextInfo from whichever message type carries it.
+// WhatsApp wraps a reply as extendedTextMessage, but some clients or
+// forwarded replies can place contextInfo on other message types too.
+function getContextInfo(m) {
+  const msg = m.message || {};
+  return (
+    msg.extendedTextMessage?.contextInfo ||
+    msg.imageMessage?.contextInfo ||
+    msg.videoMessage?.contextInfo ||
+    msg.audioMessage?.contextInfo ||
+    msg.documentMessage?.contextInfo ||
+    msg.stickerMessage?.contextInfo ||
+    msg.buttonsResponseMessage?.contextInfo ||
+    null
+  );
+}
+
+// Build a full message object so downloadMediaMessage can decrypt the
+// quoted audio. The .key (id, remoteJid, participant) is required by
+// current Baileys (6.7+); without it the call returns an empty buffer.
 function buildQuotedMessageObject(m) {
-  const ctxInfo = m.message?.extendedTextMessage?.contextInfo;
+  const ctxInfo = getContextInfo(m);
   const inner = ctxInfo?.quotedMessage;
   if (!inner) return null;
+  // Accept audioMessage (voice notes) and videoMessage (for video→audio FX)
   if (!inner.audioMessage && !inner.videoMessage) return null;
   return {
     key: {
       remoteJid: m.key.remoteJid,
-      id: ctxInfo.stanzaId,
+      id: ctxInfo.stanzaId || ctxInfo.quotedMessageId || '',
       participant: ctxInfo.participant || ctxInfo.remoteJid || m.key.remoteJid,
-      fromMe: ctxInfo.participant === undefined ? false : false,
+      fromMe: false,
     },
     message: inner,
   };
