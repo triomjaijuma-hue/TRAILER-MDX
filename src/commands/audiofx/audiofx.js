@@ -83,15 +83,49 @@ function fxCmd(name, filterArgs, description) {
       if (!buf) return reply('Reply to an audio or voice note with this command.');
       helpers.ensureTmp();
       const id = Date.now().toString(36);
-      const inFile = path.join(config.paths.tmp, `fx_${id}_in.mp3`);
-      const outFile = path.join(config.paths.tmp, `fx_${id}_out.mp3`);
+      // Use a generic .raw extension for input so ffmpeg auto-detects the
+      // container (voice notes arrive as OGG/OPUS from WhatsApp).
+      const inFile  = path.join(config.paths.tmp, `fx_${id}_in`);
+      // Output as OGG/OPUS — the only format WhatsApp reliably plays as a
+      // voice note (ptt). MP3 sent with ptt:true gives "audio not available".
+      const outFile = path.join(config.paths.tmp, `fx_${id}_out.ogg`);
       fs.writeFileSync(inFile, buf);
       try {
-        await ffmpeg(['-y', '-i', inFile, ...filterArgs, '-ac', '2', '-ar', '44100', '-b:a', '128k', outFile]);
+        await ffmpeg([
+          '-y', '-i', inFile,
+          ...filterArgs,
+          '-c:a', 'libopus',
+          '-b:a', '128k',
+          '-ac', '1',        // mono — WhatsApp voice notes are mono
+          '-ar', '48000',    // Opus native sample rate
+          outFile,
+        ]);
         const out = fs.readFileSync(outFile);
-        await sock.sendMessage(jid, { audio: out, mimetype: 'audio/mpeg', ptt: true }, { quoted: m });
+        await sock.sendMessage(
+          jid,
+          { audio: out, mimetype: 'audio/ogg; codecs=opus', ptt: true },
+          { quoted: m },
+        );
       } catch (e) {
-        reply(`FX failed: ${e?.message}\n(Make sure ffmpeg is installed in the deploy environment.)`);
+        // libopus unavailable? fall back to MP3 as a regular audio attachment
+        try {
+          const outMp3 = path.join(config.paths.tmp, `fx_${id}_out.mp3`);
+          await ffmpeg([
+            '-y', '-i', inFile,
+            ...filterArgs,
+            '-ac', '2', '-ar', '44100', '-b:a', '128k',
+            outMp3,
+          ]);
+          const out = fs.readFileSync(outMp3);
+          await sock.sendMessage(
+            jid,
+            { audio: out, mimetype: 'audio/mpeg', ptt: false },
+            { quoted: m },
+          );
+          try { fs.unlinkSync(outMp3); } catch (_) {}
+        } catch (e2) {
+          reply(`FX failed: ${e2?.message}\n(Make sure ffmpeg is installed in the deploy environment.)`);
+        }
       } finally {
         try { fs.unlinkSync(inFile); } catch (_) {}
         try { fs.unlinkSync(outFile); } catch (_) {}
