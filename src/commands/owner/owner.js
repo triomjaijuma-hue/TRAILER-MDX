@@ -28,6 +28,30 @@ module.exports = [
   { name: 'pmblocker',  owner, description: 'Block DMs from non-contacts', handler: (ctx) => setBool('pmblock', /on|true|1/i.test(ctx.argText), ctx) },
   { name: 'stealth',    owner, description: 'Toggle stealth (no presence/read)', handler: (ctx) => setBool('stealth', /on|true|1/i.test(ctx.argText), ctx) },
 
+  // ----- emergency brake -----
+  // .stop drops every outbound message (replies, reactions, presence) at the
+  // socket level. Use it to kill a runaway loop or noisy command. .resume
+  // turns the brake back off.
+  {
+    name: 'stop', owner, description: 'Emergency brake — silence all outbound replies',
+    handler: async (ctx) => {
+      const handler = require('../../handler');
+      // Send the confirmation FIRST so it actually leaves the socket; the
+      // brake takes effect immediately afterwards.
+      await ctx.reply('🛑 *STOP engaged.* All outbound replies are now paused.\nUse *.resume* to re-enable.');
+      handler.setPaused(true);
+    },
+  },
+  {
+    name: 'resume', owner, description: 'Resume outbound replies after .stop',
+    handler: async (ctx) => {
+      const handler = require('../../handler');
+      // Clear the brake FIRST so this reply is allowed through.
+      handler.setPaused(false);
+      await ctx.reply('▶️ *Resumed.* Outbound replies are flowing again.');
+    },
+  },
+
   // ----- mode (public/private) -----
   {
     name: 'mode', owner, description: 'public|private',
