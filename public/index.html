@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TRAILER-MDX · Pair Bot</title>
+<style>
+  :root {
+    --bg: #0b0f1a;
+    --bg2: #111827;
+    --card: #131a2c;
+    --border: #233056;
+    --accent: #22d3ee;
+    --accent2: #a78bfa;
+    --ok: #22c55e;
+    --warn: #f59e0b;
+    --err: #ef4444;
+    --muted: #8aa0c7;
+    --text: #e6edf6;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(167,139,250,0.18), transparent 60%),
+      radial-gradient(900px 500px at 110% 10%, rgba(34,211,238,0.18), transparent 60%),
+      linear-gradient(180deg, var(--bg), var(--bg2));
+    color: var(--text);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 460px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 28px;
+    box-shadow: 0 30px 60px rgba(0,0,0,0.45);
+  }
+  .brand {
+    display: flex; align-items: center; gap: 14px; margin-bottom: 18px;
+  }
+  .logo {
+    width: 48px; height: 48px; border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: grid; place-items: center; font-weight: 800; color: #06121f;
+    font-size: 18px; letter-spacing: 0.5px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: 0.3px; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .status {
+    display: flex; align-items: center; gap: 8px; font-size: 13px;
+    margin: 16px 0 22px 0; color: var(--muted);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 999px; background: var(--warn); box-shadow: 0 0 0 4px rgba(245,158,11,0.15); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 4px rgba(34,197,94,0.15); }
+  .dot.err { background: var(--err); box-shadow: 0 0 0 4px rgba(239,68,68,0.15); }
+  label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 8px; }
+  input[type="tel"] {
+    width: 100%; padding: 14px 16px; border-radius: 12px;
+    background: #0b1226; color: var(--text);
+    border: 1px solid var(--border); outline: none;
+    font-size: 16px; letter-spacing: 1px;
+  }
+  input[type="tel"]:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 10px; margin-top: 14px; }
+  button {
+    flex: 1; padding: 13px 16px; border-radius: 12px; border: 0;
+    font-weight: 700; cursor: pointer; font-size: 15px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #06121f;
+  }
+  button.secondary {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+  }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  .code {
+    margin-top: 22px; padding: 18px; border-radius: 14px;
+    background: #060b18; border: 1px dashed var(--border);
+    text-align: center; min-height: 64px;
+  }
+  .code .label { font-size: 12px; color: var(--muted); letter-spacing: 1.5px; text-transform: uppercase; }
+  .code .value {
+    font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+    font-size: 28px; letter-spacing: 4px; margin-top: 8px;
+    color: var(--accent);
+  }
+  .help {
+    margin-top: 18px; font-size: 12.5px; color: var(--muted); line-height: 1.55;
+  }
+  .help b { color: var(--text); }
+  .err { color: var(--err); }
+  .footer { margin-top: 18px; text-align: center; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <div class="logo">M</div>
+      <div>
+        <h1>TRAILER-MDX</h1>
+        <div class="sub">Pair your WhatsApp number to bring the bot online.</div>
+      </div>
+    </div>
+
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">Checking status…</span>
+    </div>
+
+    <label for="num">WhatsApp number (with country code, no +)</label>
+    <input id="num" type="tel" inputmode="numeric" placeholder="256706106326" autocomplete="off" />
+
+    <div class="row">
+      <button id="pairBtn">Get pairing code</button>
+      <button id="logoutBtn" class="secondary" title="Reset session">Logout</button>
+    </div>
+
+    <div class="code" id="codeBox">
+      <div class="label">Your pairing code will appear here</div>
+      <div class="value" id="codeVal">—</div>
+    </div>
+
+    <div class="help">
+      <b>How to use it:</b> open WhatsApp on your phone → <b>Settings → Linked devices → Link a device → Link with phone number instead</b>, then enter the code shown above.
+      The code is shown <b>only on this page</b> — it is never written to deploy logs.
+    </div>
+
+    <div class="footer">v6.0.0 · 267 plugins · prefixes . ! / #</div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+async function refresh() {
+  try {
+    const r = await fetch('/api/status').then(r => r.json());
+    $('statusText').textContent = r.connected
+      ? 'Bot is online — ' + (r.botNumber ? '+' + r.botNumber : 'connected')
+      : (r.hasSession ? 'Session found — reconnecting…' : 'Not paired yet — paste your number below.');
+    $('dot').className = 'dot ' + (r.connected ? 'ok' : (r.hasSession ? '' : 'err'));
+    if (!$('num').value && r.botNumber) $('num').placeholder = r.botNumber;
+  } catch (e) {
+    $('statusText').textContent = 'Could not reach the bot service.';
+    $('dot').className = 'dot err';
+  }
+}
+async function pair() {
+  const number = $('num').value.replace(/\D/g, '');
+  if (!number) { alert('Enter a number first'); return; }
+  $('pairBtn').disabled = true;
+  $('codeVal').textContent = '…';
+  try {
+    const r = await fetch('/api/pair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ number }),
+    }).then(r => r.json());
+    if (r.error) { $('codeVal').innerHTML = '<span class="err">' + r.error + '</span>'; }
+    else { $('codeVal').textContent = r.code; }
+  } catch (e) {
+    $('codeVal').innerHTML = '<span class="err">Network error</span>';
+  } finally {
+    $('pairBtn').disabled = false;
+    refresh();
+  }
+}
+async function logout() {
+  if (!confirm('Reset the WhatsApp session?')) return;
+  await fetch('/api/logout', { method: 'POST' });
+  $('codeVal').textContent = '—';
+  refresh();
+}
+$('pairBtn').addEventListener('click', pair);
+$('logoutBtn').addEventListener('click', logout);
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>
