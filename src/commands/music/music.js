@@ -125,15 +125,54 @@ async function ytdlCoreDownload(url, kind) {
   return buf;
 }
 
-// --- API provider fallbacks (mostly dead in 2026, best-effort) ----------
+// --- Invidious (most reliable free cloud-server approach in 2026) --------
+// Invidious is a YouTube front-end that exposes direct stream URLs via API.
+// These URLs are signed by YouTube for a short time and work without cookies.
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.privacydev.net',
+  'https://yt.artemislena.eu',
+  'https://invidious.nerdvpn.de',
+  'https://iv.ggtyler.dev',
+];
+
+function videoIdFromUrl(url) {
+  const m = url.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+async function invidiosFetch(ytUrl, kind) {
+  const videoId = videoIdFromUrl(ytUrl);
+  if (!videoId) throw new Error('could not parse video id');
+  for (const base of INVIDIOUS_INSTANCES) {
+    try {
+      const data = await helpers.getJson(
+        `${base}/api/v1/videos/${videoId}?fields=formatStreams,adaptiveFormats`,
+        { timeout: 14000, headers: { 'User-Agent': UA } },
+      );
+      if (kind === 'video') {
+        // formatStreams = combined audio+video streams (best for sending)
+        const streams = (data?.formatStreams || []).filter(f => f.type?.includes('video/mp4'));
+        // Prefer 480p or lower to stay under 50 MB
+        const pick = streams.find(f => (f.quality || '').includes('480'))
+                  || streams.find(f => (f.quality || '').includes('360'))
+                  || streams.find(f => (f.quality || '').includes('720'))
+                  || streams[0];
+        if (pick?.url) return { directUrl: pick.url, source: `invidious` };
+      } else {
+        // For audio prefer m4a adaptive stream
+        const adaptives = data?.adaptiveFormats || [];
+        const pick = adaptives.find(f => f.type?.includes('audio/mp4'))
+                  || adaptives.find(f => f.audioSampleRate);
+        if (pick?.url) return { directUrl: pick.url, source: `invidious` };
+      }
+    } catch (_) {}
+  }
+  throw new Error('all invidious instances failed');
+}
+
+// --- API provider fallbacks ---------------------------------------------
 const AUDIO_PROVIDERS = [
-  {
-    name: 'cobalt',
-    method: 'POST',
-    build: () => 'https://api.cobalt.tools/',
-    body: (u) => ({ url: u, downloadMode: 'audio', audioFormat: 'mp3' }),
-    pick: (d) => (d?.status === 'tunnel' || d?.status === 'redirect') ? d?.url : null,
-  },
   {
     name: 'davidcyril',
     build: (u) => `https://api.davidcyriltech.xyz/download/ytmp3?url=${encodeURIComponent(u)}`,
@@ -147,13 +186,6 @@ const AUDIO_PROVIDERS = [
 ];
 
 const VIDEO_PROVIDERS = [
-  {
-    name: 'cobalt',
-    method: 'POST',
-    build: () => 'https://api.cobalt.tools/',
-    body: (u) => ({ url: u, downloadMode: 'auto', videoQuality: '480' }),
-    pick: (d) => (d?.status === 'tunnel' || d?.status === 'redirect') ? d?.url : null,
-  },
   {
     name: 'davidcyril',
     build: (u) => `https://api.davidcyriltech.xyz/download/ytmp4?url=${encodeURIComponent(u)}`,
@@ -202,11 +234,11 @@ async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
   return buf;
 }
 
-// --- Main download function: yt-dlp → @distube/ytdl-core → API wrappers -
+// --- Main download function: yt-dlp → invidious → ytdl-core → API wrappers -
 async function fetchYouTubeMedia(url, kind) {
   const errors = [];
 
-  // 1. yt-dlp (most reliable in 2026 — needs binary in PATH or ./bin/)
+  // 1. yt-dlp (most reliable — needs binary in PATH or ./bin/)
   if (await probeYtdlp()) {
     try {
       const buf = await ytdlpDownload(url, kind);
@@ -216,13 +248,21 @@ async function fetchYouTubeMedia(url, kind) {
     errors.push('yt-dlp: not installed');
   }
 
-  // 2. @distube/ytdl-core (already in package.json, no binary needed)
+  // 2. Invidious — public instances expose signed direct URLs, no auth needed.
+  //    Most reliable free approach from cloud servers where YouTube blocks scrapers.
+  try {
+    const { directUrl, source } = await invidiosFetch(url, kind);
+    const buf = await downloadCapped(directUrl);
+    return { buf, source };
+  } catch (e) { errors.push(`invidious: ${e.message?.slice(0, 120)}`); }
+
+  // 3. @distube/ytdl-core (often blocked by YouTube bot detection in 2026)
   try {
     const buf = await ytdlCoreDownload(url, kind);
     return { buf, source: 'ytdl-core' };
   } catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 120)}`); }
 
-  // 3. Community wrapper APIs (best-effort, mostly dead in 2026)
+  // 4. Community wrapper APIs (best-effort)
   const providers = kind === 'audio' ? AUDIO_PROVIDERS : VIDEO_PROVIDERS;
   try {
     const { direct, source } = await resolveDirectUrl(providers, url);
