@@ -8,11 +8,37 @@ const store = require('./store');
 
 const HISTORY_LIMIT = 20;
 
+// Resolve an API key for a provider — runtime store first (set via .aikey),
+// then env-var (set on Railway). This lets owners rotate keys from WhatsApp
+// without redeploying.
+function keyFor(provider) {
+  const fromStore = (store.get().aiKeys || {})[provider];
+  if (fromStore) return fromStore;
+  switch (provider) {
+    case 'gemini':     return config.geminiKey;
+    case 'groq':       return config.groqKey;
+    case 'openrouter': return config.openrouterKey;
+    case 'openai':     return config.openaiKey;
+    default:           return '';
+  }
+}
+
+function keySource(provider) {
+  if ((store.get().aiKeys || {})[provider]) return 'store';
+  switch (provider) {
+    case 'gemini':     return config.geminiKey ? 'env' : null;
+    case 'groq':       return config.groqKey ? 'env' : null;
+    case 'openrouter': return config.openrouterKey ? 'env' : null;
+    case 'openai':     return config.openaiKey ? 'env' : null;
+    default:           return null;
+  }
+}
+
 function activeProvider() {
-  if (config.geminiKey) return 'gemini';
-  if (config.groqKey) return 'groq';
-  if (config.openrouterKey) return 'openrouter';
-  if (config.openaiKey) return 'openai';
+  if (keyFor('gemini')) return 'gemini';
+  if (keyFor('groq')) return 'groq';
+  if (keyFor('openrouter')) return 'openrouter';
+  if (keyFor('openai')) return 'openai';
   return null;
 }
 
@@ -51,7 +77,7 @@ async function geminiChat(messages, model) {
   let lastErr;
   for (const m of tryList) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(config.geminiKey)}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(keyFor('gemini'))}`;
       const r = await axios.post(url, body, { timeout: 30000 });
       const text = r.data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
       return text.trim() || '(empty response)';
@@ -108,10 +134,7 @@ async function chat(prompt, opts = {}) {
   // Build a fallback chain: try the active provider, then the next configured ones in priority order.
   for (const p of ['gemini', 'groq', 'openrouter', 'openai']) {
     if (p === provider) continue;
-    if (p === 'gemini' && config.geminiKey) tryProviders.push(p);
-    if (p === 'groq' && config.groqKey) tryProviders.push(p);
-    if (p === 'openrouter' && config.openrouterKey) tryProviders.push(p);
-    if (p === 'openai' && config.openaiKey) tryProviders.push(p);
+    if (keyFor(p)) tryProviders.push(p);
   }
 
   let lastErr;
@@ -119,9 +142,9 @@ async function chat(prompt, opts = {}) {
     try {
       const m = modelFor(p, opts.model);
       if (p === 'gemini')     return await geminiChat(messages, m);
-      if (p === 'groq')       return await openaiCompatibleChat('https://api.groq.com/openai/v1', config.groqKey, messages, m);
-      if (p === 'openrouter') return await openaiCompatibleChat('https://openrouter.ai/api/v1', config.openrouterKey, messages, m);
-      if (p === 'openai')     return await openaiCompatibleChat('https://api.openai.com/v1', config.openaiKey, messages, m);
+      if (p === 'groq')       return await openaiCompatibleChat('https://api.groq.com/openai/v1', keyFor('groq'), messages, m);
+      if (p === 'openrouter') return await openaiCompatibleChat('https://openrouter.ai/api/v1', keyFor('openrouter'), messages, m);
+      if (p === 'openai')     return await openaiCompatibleChat('https://api.openai.com/v1', keyFor('openai'), messages, m);
     } catch (e) {
       lastErr = e;
       // Try next provider on rate-limit / quota / auth errors
@@ -146,12 +169,12 @@ async function image(prompt) {
   } catch (e) {
     // fall through to OpenAI if available
   }
-  if (config.openaiKey) {
+  if (keyFor('openai')) {
     try {
       const r = await axios.post(
         'https://api.openai.com/v1/images/generations',
         { model: 'gpt-image-1', prompt, size: '1024x1024', n: 1 },
-        { timeout: 60000, headers: { Authorization: `Bearer ${config.openaiKey}` } }
+        { timeout: 60000, headers: { Authorization: `Bearer ${keyFor('openai')}` } }
       );
       const b64 = r.data?.data?.[0]?.b64_json;
       const url = r.data?.data?.[0]?.url;
@@ -182,4 +205,4 @@ async function autoReply(jid, prompt) {
   return reply;
 }
 
-module.exports = { chat, image, autoReply, isConfigured, activeProvider };
+module.exports = { chat, image, autoReply, isConfigured, activeProvider, keyFor, keySource };

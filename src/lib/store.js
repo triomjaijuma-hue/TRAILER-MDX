@@ -9,6 +9,7 @@ const defaults = () => ({
   aiOn: {},          // { jid: true|false }
   aiOnAll: false,    // when true, AI auto-replies in every DM by default
   aiHistory: {},     // { jid: [{role, content}] }
+  aiKeys: {},        // { gemini, groq, openrouter, openai } — set via .aikey at runtime
   autoreact: false,
   autoread: false,
   autotyping: false,
