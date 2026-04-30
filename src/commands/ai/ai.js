@@ -61,4 +61,30 @@ module.exports = [
       reply('AI auto-reply is now *OFF* for this chat.');
     },
   },
+  {
+    name: 'aionall',
+    description: 'Turn AI auto-reply ON for ALL DMs (global)',
+    owner: true,
+    handler: async ({ reply }) => {
+      if (!ai.isConfigured()) return reply('AI is not configured. Set OPENAI_API_KEY (or OPENROUTER_API_KEY) in your environment.');
+      const s = store.get();
+      // Wipe per-chat overrides so the global flag truly applies everywhere
+      s.aiOn = {};
+      store.set({ aiOn: s.aiOn, aiOnAll: true });
+      reply('🤖 AI auto-reply is now *ON for ALL DMs*. The bot will reply to every direct chat with rolling memory.\n\nUse `.aioff` in any specific chat to silence it there, or `.aioffall` to disable globally.');
+    },
+  },
+  {
+    name: 'aioffall',
+    description: 'Turn AI auto-reply OFF for ALL DMs (global)',
+    owner: true,
+    handler: async ({ reply, argText }) => {
+      const s = store.get();
+      s.aiOn = {};
+      const patch = { aiOn: s.aiOn, aiOnAll: false };
+      if (/clear|reset/i.test(argText)) patch.aiHistory = {};
+      store.set(patch);
+      reply(`🤖 AI auto-reply is now *OFF for ALL DMs*.${/clear|reset/i.test(argText) ? '\nAll conversation history cleared.' : ''}`);
+    },
+  },
 ];

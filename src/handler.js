@@ -100,8 +100,9 @@ async function handleAutoFeatures(ctx) {
     setTimeout(() => sock.sendPresenceUpdate('paused', jid).catch(() => {}), 1500);
   }
 
-  // .aion auto-reply: only DMs, not groups, not from me
-  if (!isGroup && !ctx.fromMe && s.aiOn[jid] && ctx.text && !parsePrefix(ctx.text)) {
+  // .aion / .aionall auto-reply: only DMs, not groups, not from me
+  const aiActive = s.aiOn[jid] === true || (s.aiOnAll && s.aiOn[jid] !== false);
+  if (!isGroup && !ctx.fromMe && aiActive && ctx.text && !parsePrefix(ctx.text)) {
     try {
       const out = await ai.autoReply(jid, ctx.text);
       await reply(ctx.sock, m, out);

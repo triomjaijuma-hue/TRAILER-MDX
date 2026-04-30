@@ -7,6 +7,7 @@ const STORE_PATH = path.resolve(__dirname, '..', '..', 'auth_info', 'store.json'
 
 const defaults = () => ({
   aiOn: {},          // { jid: true|false }
+  aiOnAll: false,    // when true, AI auto-replies in every DM by default
   aiHistory: {},     // { jid: [{role, content}] }
   autoreact: false,
   autoread: false,
