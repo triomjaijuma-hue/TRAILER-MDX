@@ -112,35 +112,78 @@ module.exports = [
     } catch (e) { reply(`Failed: ${e?.message}`); }
   } },
 
-  // .news — used to just echo a search URL. Now actually fetches the
-  // top headlines from Google News RSS and sends them inline. Falls back
-  // to the search link if the RSS feed is unreachable.
+  // .news — fetches top headlines (Google News RSS, with BBC fallback).
+  // Sends actual headline + source + snippet, not just a search URL.
   { name: 'news', description: 'Top headlines (Google News)', handler: async ({ argText, reply }) => {
     const q = (argText || '').trim();
-    const feedUrl = q
-      ? `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`
-      : `https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en`;
-    try {
-      const xml = await helpers.getText(feedUrl, { timeout: 15000 });
-      const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 8);
-      if (!items.length) throw new Error('no items');
-      const parsed = items.map(([, body]) => {
+    const NEWS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+    const stripHtml = (s) => (s || '')
+      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const parseRss = (xml) => {
+      const items = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/g)].slice(0, 8);
+      return items.map(([, body]) => {
         const pick = (tag) => {
-          const m = body.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`));
+          // Match <tag> OR <tag attr="...">
+          const m = body.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`));
           if (!m) return '';
-          let v = m[1].trim();
-          if (v.startsWith('<![CDATA[')) v = v.slice(9, -3);
-          return v;
+          return stripHtml(m[1]);
         };
-        return { title: pick('title'), link: pick('link'), source: pick('source'), pubDate: pick('pubDate') };
-      });
-      const heading = q ? `📰 *Top News: ${q}*` : '📰 *Top Headlines*';
-      const out = [heading, '', ...parsed.map((it, i) =>
-        `${i + 1}. *${it.title}*${it.source ? `\n   _${it.source}_` : ''}\n   ${it.link}`
-      )].join('\n\n');
-      reply(out.slice(0, 4000));
-    } catch (_) {
-      reply(`📰 News feed unreachable. Search link:\nhttps://news.google.com/search?q=${encodeURIComponent(q || 'world')}`);
+        return {
+          title: pick('title'),
+          link: pick('link'),
+          source: pick('source'),
+          description: pick('description'),
+          pubDate: pick('pubDate'),
+        };
+      }).filter(it => it.title && it.link);
+    };
+
+    const sources = q
+      ? [`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`]
+      : [
+          `https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en`,
+          `https://feeds.bbci.co.uk/news/world/rss.xml`,
+        ];
+
+    let parsed = [];
+    let lastErr = '';
+    for (const url of sources) {
+      try {
+        const xml = await helpers.getText(url, {
+          timeout: 15000,
+          headers: { 'User-Agent': NEWS_UA, Accept: 'application/rss+xml, application/xml, text/xml, */*' },
+        });
+        parsed = parseRss(xml);
+        if (parsed.length) break;
+        lastErr = 'no items in feed';
+      } catch (e) {
+        lastErr = e?.message || 'fetch failed';
+      }
     }
+
+    if (!parsed.length) {
+      return reply(`📰 News feed unreachable (${lastErr}). Search link:\nhttps://news.google.com/search?q=${encodeURIComponent(q || 'world')}`);
+    }
+
+    const heading = q ? `📰 *Top News: ${q}*` : '📰 *Top Headlines*';
+    const lines = parsed.map((it, i) => {
+      const snippet = it.description && it.description !== it.title
+        ? `\n   ${it.description.slice(0, 180)}${it.description.length > 180 ? '…' : ''}`
+        : '';
+      const src = it.source ? `\n   _${it.source}_` : '';
+      return `${i + 1}. *${it.title}*${src}${snippet}\n   ${it.link}`;
+    });
+    reply([heading, '', ...lines].join('\n\n').slice(0, 4000));
   } },
 ];
