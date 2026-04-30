@@ -21,8 +21,16 @@ function isConfigured() {
 }
 
 // ---------- Gemini (Google AI Studio — FREE) ----------
+// Model names change — try the current ones in order, fall back if a model is gone.
+const GEMINI_MODELS = [
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-001',
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-002',
+  'gemini-pro',
+];
+
 async function geminiChat(messages, model) {
-  const m = model || 'gemini-1.5-flash-latest';
   // Convert OpenAI-style messages to Gemini format
   let systemInstruction;
   const contents = [];
@@ -36,12 +44,27 @@ async function geminiChat(messages, model) {
       });
     }
   }
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(config.geminiKey)}`;
   const body = { contents, generationConfig: { temperature: 0.7, maxOutputTokens: 1024 } };
   if (systemInstruction) body.systemInstruction = systemInstruction;
-  const r = await axios.post(url, body, { timeout: 30000 });
-  const text = r.data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
-  return text.trim() || '(empty response)';
+
+  const tryList = model ? [model, ...GEMINI_MODELS.filter(m => m !== model)] : GEMINI_MODELS;
+  let lastErr;
+  for (const m of tryList) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(config.geminiKey)}`;
+      const r = await axios.post(url, body, { timeout: 30000 });
+      const text = r.data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+      return text.trim() || '(empty response)';
+    } catch (e) {
+      lastErr = e;
+      const status = e?.response?.status;
+      const msg = e?.response?.data?.error?.message || '';
+      // Model not found / not supported — try the next one. Otherwise rethrow.
+      const modelMissing = status === 404 || /not found|not supported|generateContent/i.test(msg);
+      if (!modelMissing) throw e;
+    }
+  }
+  throw lastErr;
 }
 
 // ---------- Groq (FREE, OpenAI-compatible) ----------
@@ -63,7 +86,7 @@ async function openaiCompatibleChat(baseURL, apiKey, messages, model) {
 function modelFor(provider, requested) {
   if (requested) return requested;
   switch (provider) {
-    case 'gemini':     return 'gemini-1.5-flash-latest';
+    case 'gemini':     return null; // geminiChat() picks from GEMINI_MODELS fallback list
     case 'groq':       return 'llama-3.1-8b-instant';
     case 'openrouter': return 'meta-llama/llama-3.1-8b-instruct:free';
     case 'openai':     return 'gpt-4o-mini';
