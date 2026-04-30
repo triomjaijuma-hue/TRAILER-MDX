@@ -117,6 +117,7 @@ function gameMenu() {
     '  .math          —  🧮 Math problem — reply with answer',
     '  .hangman       —  🪢 Hangman — reply with letter or word',
     '  .tictactoe     —  ⭕ Tic-Tac-Toe vs bot — reply 1-9',
+    '  .quiz          —  🎓 5-question quiz (auto-advances)',
     '',
     '_Start any game by typing the command above._',
   ].join('\n');
@@ -200,6 +201,24 @@ module.exports = [
         `⭕ *TIC-TAC-TOE*\nYou are *X*, bot is *O*\n\n` +
         `${gs.renderBoard(Array(9).fill(null))}\n\n` +
         `_Reply with a number 1-9 to place your X._`,
+      );
+    },
+  },
+  {
+    name: 'quiz',
+    description: '5-question quiz — replies auto-advance to next question',
+    handler: async ({ jid, reply }) => {
+      // Shuffle the full trivia bank and take 5 unique questions
+      const questions = [...TRIVIA]
+        .sort(() => Math.random() - 0.5)
+        .slice(0, 5);
+      gs.set(`quiz:${jid}`, { questions, current: 0, score: 0 });
+      const first = questions[0];
+      reply(
+        `🎓 *QUIZ TIME!*\n` +
+        `5 questions — reply with your answer after each one.\n\n` +
+        `*Question 1/5*\n🧠 ${first.q}\n\n` +
+        `_Reply with your answer to start!_`,
       );
     },
   },
