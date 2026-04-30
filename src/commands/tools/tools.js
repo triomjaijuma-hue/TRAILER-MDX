@@ -105,19 +105,49 @@ module.exports = [
   { name: 'readmore', description: 'Insert "Read more" hidden text', handler: async ({ argText, reply }) => reply(`Visible…${'\u200E'.repeat(4000)}\n${argText}`) },
   { name: 'smallcaps', description: 'Convert text to small caps', handler: async ({ argText, reply }) => reply([...argText.toLowerCase()].map(c => SMALL_CAPS[c] || c).join('')) },
   { name: 'tourl', description: 'Upload media to a temp host (stub)', handler: async ({ reply }) => reply('Use .catbox or .tmpfiles to upload media to a public URL.') },
-  { name: 'translate', description: 'translate <lang> <text> (uses LibreTranslate-compatible)', handler: async ({ argText, reply }) => {
-    const m = argText.match(/^(\w{2,5})\s+(.+)/);
+  { name: 'translate', aliases: ['trans', 'tr'], description: 'translate <lang> <text> (free, no key)', handler: async ({ argText, reply }) => {
+    const m = argText.match(/^(\w{2,5})\s+([\s\S]+)/);
     if (!m) return reply('Usage: .translate <lang> <text>  e.g. .translate fr Hello');
+    const target = m[1].toLowerCase();
+    const text = m[2];
     try {
-      const r = await require('axios').post('https://translate.argosopentech.com/translate', { q: m[2], source: 'auto', target: m[1], format: 'text' }, { timeout: 15000 });
-      reply(r.data.translatedText || '(no result)');
-    } catch (e) { reply(`Translate failed: ${e?.message}`); }
+      const r = await require('axios').get('https://api.mymemory.translated.net/get', {
+        timeout: 15000,
+        params: { q: text.slice(0, 4500), langpair: `auto|${target}` },
+      });
+      const t = r.data?.responseData?.translatedText;
+      if (t) return reply(t);
+    } catch (_) {}
+    try {
+      const r = await require('axios').get('https://translate.googleapis.com/translate_a/single', {
+        timeout: 15000,
+        params: { client: 'gtx', sl: 'auto', tl: target, dt: 't', q: text },
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+      const out = (r.data?.[0] || []).map(p => p[0]).join('');
+      if (out) return reply(out);
+    } catch (_) {}
+    try {
+      const r = await require('axios').post('https://translate.argosopentech.com/translate', { q: text, source: 'auto', target, format: 'text' }, { timeout: 15000 });
+      if (r.data?.translatedText) return reply(r.data.translatedText);
+    } catch (_) {}
+    reply('Translate failed — all providers unreachable. Try again in a moment.');
   } },
-  { name: 'tts', description: 'Text to speech (uses Google translate TTS)', handler: async ({ sock, jid, m, argText, reply }) => {
+  { name: 'tts', description: 'Text to speech (Google translate TTS)', handler: async ({ sock, jid, m, argText, reply }) => {
     if (!argText) return reply('Usage: .tts <text>');
+    const chunks = String(argText).match(/[^.!?\n]{1,180}[.!?\n]?/g) || [argText.slice(0, 180)];
     try {
-      const buf = await helpers.downloadToBuffer(`https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(argText)}&tl=en&client=tw-ob`);
-      await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mpeg', ptt: true }, { quoted: m });
+      const buffers = [];
+      for (const chunk of chunks.slice(0, 6)) {
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(chunk.trim())}&tl=en&client=tw-ob&ttsspeed=1`;
+        const buf = await require('axios').get(url, {
+          responseType: 'arraybuffer', timeout: 20000,
+          headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://translate.google.com/' },
+        }).then(r => Buffer.from(r.data));
+        buffers.push(buf);
+      }
+      const out = Buffer.concat(buffers);
+      await sock.sendMessage(jid, { audio: out, mimetype: 'audio/mpeg', ptt: true }, { quoted: m });
     } catch (e) { reply(`TTS failed: ${e?.message}`); }
   } },
   { name: 'vnote', description: 'Convert quoted audio to voice note', handler: async ({ sock, jid, m, reply }) => {

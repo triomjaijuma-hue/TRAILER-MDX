@@ -201,6 +201,19 @@ function getCategories() {
   return out;
 }
 
+function reload() {
+  // Clear cached plugin modules so file changes are picked up,
+  // then rebuild the registry from scratch.
+  const baseDir = config.paths.plugins;
+  for (const k of Object.keys(require.cache)) {
+    if (k.startsWith(baseDir)) delete require.cache[k];
+  }
+  commands.clear();
+  aliases.clear();
+  loadPlugins();
+  return { count: commands.size };
+}
+
 loadPlugins();
 
-module.exports = { onMessages, getCommands, getCategories };
+module.exports = { onMessages, getCommands, getCategories, reload };

@@ -15,10 +15,14 @@ const defaults = () => ({
   autostatus: false,
   anticall: true,
   antidelete: true,
-  antibadword: {},
-  antilink: {},
-  antispam: {},
-  antitag: {},
+  antibadword: {},   // { groupJid: true|[words] }
+  antilink: {},      // { groupJid: true }
+  antispam: {},      // { groupJid: true }
+  antitag: {},       // { groupJid: true }
+  badwords: [],      // global list (lowercased)
+  welcome: {},       // { groupJid: { enabled, text } }
+  goodbye: {},       // { groupJid: { enabled, text } }
+  notes: {},         // { jidOrGlobal: { name: text } }
   warns: {},         // { groupJid: { userJid: count } }
   replies: {},       // { keyword: response }
   rented: [],

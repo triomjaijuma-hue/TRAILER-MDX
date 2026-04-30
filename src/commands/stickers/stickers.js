@@ -66,13 +66,24 @@ module.exports = [
     },
   },
   {
-    name: 'attp', description: 'Animated text-to-pic sticker',
+    name: 'attp', description: 'Text-to-pic sticker (rendered locally)',
     handler: async ({ sock, jid, m, argText, reply }) => {
       if (!argText) return reply('Usage: .attp <text>');
       try {
-        const buf = await helpers.downloadToBuffer(`https://api.xteam.xyz/attp?file&text=${encodeURIComponent(argText)}`).catch(() => null);
-        if (!buf) return reply('attp service unavailable.');
-        const sb = await makeSticker(buf);
+        const safe = String(argText).slice(0, 60).replace(/[<&>]/g, '');
+        const len = [...safe].length;
+        const fontSize = len <= 8 ? 140 : len <= 16 ? 100 : len <= 28 ? 70 : 50;
+        const colors = ['#ff3b3b', '#22d3ee', '#a78bfa', '#facc15', '#34d399', '#f472b6'];
+        const c = colors[Math.floor(Math.random() * colors.length)];
+        const svg = Buffer.from(
+          `<svg xmlns='http://www.w3.org/2000/svg' width='512' height='512' viewBox='0 0 512 512'>` +
+          `<rect width='100%' height='100%' fill='#000'/>` +
+          `<text x='50%' y='50%' text-anchor='middle' dominant-baseline='middle' ` +
+          `font-family='Impact, Arial Black, sans-serif' font-weight='900' ` +
+          `font-size='${fontSize}' fill='${c}' stroke='#ffffff' stroke-width='3'>${safe}</text></svg>`
+        );
+        const png = await sharp(svg).png().toBuffer();
+        const sb = await makeSticker(png);
         await sock.sendMessage(jid, { sticker: sb }, { quoted: m });
       } catch (e) { reply(`attp failed: ${e?.message}`); }
     },
@@ -89,12 +100,23 @@ module.exports = [
     handler: async ({ sock, jid, m, argText, reply }) => {
       const parts = argText.split(/\s+/).filter(Boolean);
       if (parts.length < 2) return reply('Usage: .emojimix 😀 🎉');
-      const url = `https://www.gstatic.com/android/keyboard/emojikitchen/20201001/u${parts[0].codePointAt(0).toString(16)}/u${parts[0].codePointAt(0).toString(16)}_u${parts[1].codePointAt(0).toString(16)}.png`;
-      try {
-        const buf = await helpers.downloadToBuffer(url);
-        const sb = await makeSticker(buf);
-        await sock.sendMessage(jid, { sticker: sb }, { quoted: m });
-      } catch { reply('No mix found for that combo.'); }
+      const a = encodeURIComponent(parts[0]);
+      const b = encodeURIComponent(parts[1]);
+      const candidates = [
+        `https://emojik.vercel.app/s/${a}_${b}?size=512`,
+        `https://emojikitchen.dev/api/sticker?emojis=${a}_${b}`,
+      ];
+      for (const url of candidates) {
+        try {
+          const buf = await helpers.downloadToBuffer(url, { timeout: 15000 });
+          if (buf && buf.length > 1024) {
+            const sb = await makeSticker(buf);
+            await sock.sendMessage(jid, { sticker: sb }, { quoted: m });
+            return;
+          }
+        } catch (_) {}
+      }
+      reply('No mix found for that combo. Try a different pair (not all combinations exist).');
     },
   },
   {

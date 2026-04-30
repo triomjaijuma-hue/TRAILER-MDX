@@ -202,6 +202,9 @@ async function start() {
         if (proto && (proto.type === 0 || proto.type === 'REVOKE')) {
           await handleRevoke(m, proto);
         }
+        try { await enforceGroupRules(m); } catch (e) {
+          logger.warn({ err: e?.message }, 'enforceGroupRules failed');
+        }
       }
     } catch (e) {
       logger.warn({ err: e?.message }, 'messages.upsert pre-handler failed');
@@ -209,7 +212,110 @@ async function start() {
     handler.onMessages(sock, ev);
   });
 
+  // Welcome / goodbye on group-participants.update
+  sock.ev.on('group-participants.update', async (ev) => {
+    try {
+      const s = store.get();
+      const jid = ev.id;
+      if (!jid?.endsWith('@g.us')) return;
+      const meta = await sock.groupMetadata(jid).catch(() => null);
+      const groupName = meta?.subject || 'this group';
+      const memberCount = meta?.participants?.length || 0;
+
+      const isAdd = ev.action === 'add';
+      const isRemove = ev.action === 'remove' || ev.action === 'leave';
+      const cfg = isAdd ? s.welcome[jid] : isRemove ? s.goodbye[jid] : null;
+      if (!cfg?.enabled) return;
+
+      const defaultText = isAdd
+        ? '👋 Welcome @{user} to *{group}*! You are member #{count}.'
+        : '👋 Goodbye @{user} — see you again sometime.';
+      const tpl = cfg.text || defaultText;
+
+      for (const participant of ev.participants || []) {
+        const userTag = `@${participant.split('@')[0]}`;
+        const text = tpl
+          .replaceAll('{user}', userTag)
+          .replaceAll('{group}', groupName)
+          .replaceAll('{count}', String(memberCount));
+        await sock.sendMessage(jid, { text, mentions: [participant] }).catch(() => {});
+      }
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'group-participants handler failed');
+    }
+  });
+
   return sock;
+}
+
+// Per-chat sliding window for spam detection.
+const spamWindows = new Map(); // `${jid}:${sender}` -> [timestamps]
+
+async function enforceGroupRules(m) {
+  if (!m?.key?.remoteJid?.endsWith('@g.us')) return;
+  if (m.key.fromMe) return;
+  const s = store.get();
+  const jid = m.key.remoteJid;
+  const sender = m.key.participant || m.participant;
+  if (!sender) return;
+  const me = sock?.user?.id?.split(':')[0];
+  if (me && sender.split('@')[0] === me) return;
+
+  const text =
+    m.message?.conversation ||
+    m.message?.extendedTextMessage?.text ||
+    m.message?.imageMessage?.caption ||
+    m.message?.videoMessage?.caption ||
+    '';
+
+  if (helpers.isOwner(sender)) return;
+
+  let meta = null;
+  let botIsAdmin = false;
+  let senderIsAdmin = false;
+  const needsAdmin = s.antilink[jid] || s.antibadword[jid] || s.antispam[jid] || s.antitag[jid];
+  if (needsAdmin) {
+    meta = await sock.groupMetadata(jid).catch(() => null);
+    if (meta) {
+      const myFullJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+      botIsAdmin = meta.participants.some(p => p.id === myFullJid && (p.admin === 'admin' || p.admin === 'superadmin'));
+      senderIsAdmin = meta.participants.some(p => p.id === sender && (p.admin === 'admin' || p.admin === 'superadmin'));
+    }
+  }
+  if (senderIsAdmin) return;
+
+  async function deleteOffending(reason) {
+    if (!botIsAdmin) return;
+    try { await sock.sendMessage(jid, { delete: m.key }); } catch (_) {}
+    await sock.sendMessage(jid, { text: `🛡️ ${reason} — message removed (@${sender.split('@')[0]})`, mentions: [sender] }).catch(() => {});
+  }
+
+  if (s.antilink[jid] && /(https?:\/\/|chat\.whatsapp\.com\/|wa\.me\/)/i.test(text)) {
+    return deleteOffending('Anti-link active');
+  }
+  if (s.antibadword[jid] && (s.badwords || []).length) {
+    const lc = text.toLowerCase();
+    if (s.badwords.some(w => w && lc.includes(w))) {
+      return deleteOffending('Bad-word filter');
+    }
+  }
+  if (s.antitag[jid]) {
+    const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    if (mentioned.length >= 5) {
+      return deleteOffending('Mass-tag blocked');
+    }
+  }
+  if (s.antispam[jid]) {
+    const key = `${jid}:${sender}`;
+    const now = Date.now();
+    const arr = (spamWindows.get(key) || []).filter(t => now - t < 8000);
+    arr.push(now);
+    spamWindows.set(key, arr);
+    if (arr.length > 5) {
+      spamWindows.set(key, []);
+      return deleteOffending('Anti-spam (slow down)');
+    }
+  }
 }
 
 async function requestPairing(number) {

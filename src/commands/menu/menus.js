@@ -1,4 +1,6 @@
 'use strict';
+// Sub-menus that document related commands. Every entry below is now backed
+// by a real, working command somewhere in the registry.
 function makeSubmenu(name, items) {
   return {
     name,
@@ -8,11 +10,11 @@ function makeSubmenu(name, items) {
 }
 
 module.exports = [
-  makeSubmenu('animes', ['waifu', 'neko', 'hug', 'kiss', 'pat', 'cuddle']),
-  makeSubmenu('audiofx', ['bass', 'deep', 'fast', 'slow', 'reverse', 'tupai', 'nightcore']),
-  makeSubmenu('notes', ['.addnote', '.delnote', '.listnotes', '.getnote']),
-  makeSubmenu('privacy', ['.online', '.offline', '.read on/off', '.lastseen on/off']),
+  makeSubmenu('animes', ['.waifu', '.neko', '.hug', '.kiss', '.pat', '.cuddle']),
+  makeSubmenu('audiofx', ['.bass', '.deep', '.fast', '.slow', '.reverse', '.nightcore']),
+  makeSubmenu('notes', ['.addnote <name> | <text>', '.delnote <name>', '.listnotes', '.getnote <name>']),
+  makeSubmenu('privacy', ['.online', '.offline', '.read on/off', '.stealth on/off']),
   makeSubmenu('images', ['.coding', '.cyberimg', '.game', '.islamic', '.mountain', '.pies', '.tech']),
-  makeSubmenu('stext', ['.smallcaps', '.bold', '.italic', '.mono']),
-  makeSubmenu('ephoto', ['.glitch', '.neon', '.metallic', '.fire']),
+  makeSubmenu('stext', ['.smallcaps', '.bold', '.italic', '.mono', '.strike', '.underline']),
+  makeSubmenu('ephoto', ['.glitchtxt <text>', '.neontxt <text>', '.firetxt <text>', '.metaltxt <text>']),
 ];

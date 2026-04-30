@@ -1,9 +1,40 @@
 'use strict';
 const helpers = require('../../lib/helpers');
-const fs = require('fs');
-const path = require('path');
-const { execSync } = require('child_process');
-const config = require('../../lib/config');
+const axios = require('axios');
+
+// Cobalt v10 changed the API. There is no single canonical free instance any
+// more — try the official one, then a couple of community mirrors. Body schema
+// changed too: {url, downloadMode, audioFormat, videoQuality}.
+const COBALT_INSTANCES = [
+  'https://api.cobalt.tools',
+  'https://co.wuk.sh',
+  'https://capi.oak.li',
+];
+
+async function cobaltResolve(targetUrl, audioOnly = false) {
+  const body = audioOnly
+    ? { url: targetUrl, downloadMode: 'audio', audioFormat: 'mp3' }
+    : { url: targetUrl, downloadMode: 'auto', videoQuality: '720' };
+  let lastErr;
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const r = await axios.post(`${base}/`, body, {
+        timeout: 25000,
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      });
+      const d = r.data;
+      // v10: { status: 'redirect'|'tunnel'|'picker'|'error', url, picker }
+      // legacy: { status: 'success'|'stream'|'picker', url, audio, picker }
+      if (d?.status === 'error') { lastErr = new Error(d?.error?.code || 'cobalt error'); continue; }
+      if (d?.url) return { url: d.url };
+      if (d?.audio) return { url: d.audio };
+      if (Array.isArray(d?.picker) && d.picker.length) return { picker: d.picker.map(p => p.url).filter(Boolean).slice(0, 5) };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('All cobalt instances unreachable.');
+}
 
 function makeFetcher(name, hint) {
   return {
@@ -11,23 +42,13 @@ function makeFetcher(name, hint) {
     description: `Download from ${name}`,
     handler: async ({ argText, reply }) => {
       if (!argText) return reply(`Usage: .${name} <url>`);
-      // Try a public any-downloader API (best-effort, may rate-limit)
       try {
-        const r = await helpers.getJson(`https://api.cobalt.tools/api/json`, {
-          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        }).catch(() => null);
-        // We use a POST below if GET-style not supported
-      } catch (_) {}
-      try {
-        const post = await require('axios').post('https://api.cobalt.tools/api/json',
-          { url: argText, vQuality: '720', isAudioOnly: false },
-          { headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' }, timeout: 30000 });
-        const d = post.data;
-        if (d?.url) return reply(`*${name}*\n${d.url}`);
-        if (d?.picker) return reply(d.picker.map(p => `• ${p.url}`).slice(0, 5).join('\n'));
+        const result = await cobaltResolve(argText.trim(), false);
+        if (result.url) return reply(`*${name}*\n${result.url}`);
+        if (result.picker) return reply(`*${name} — pick one:*\n${result.picker.join('\n')}`);
         return reply(`Could not auto-resolve. ${hint || ''}`.trim());
       } catch (e) {
-        return reply(`Download service unavailable. ${hint || ''}`.trim());
+        return reply(`Download service unavailable for *${name}* (${e?.message || 'unknown error'}). ${hint || ''}`.trim());
       }
     },
   };
@@ -44,10 +65,10 @@ module.exports = [
   makeFetcher('terabox'),
   makeFetcher('mediafire'),
   makeFetcher('mega'),
-  makeFetcher('spotify'),
   makeFetcher('vidsplay'),
-  makeFetcher('video'),
   makeFetcher('dlstatus'),
+  // NOTE: .video and .spotify intentionally removed here — they collide with
+  // the music plugin which already handles YouTube and Spotify properly.
   {
     name: 'apkdl', description: 'Search APK on apkpure',
     handler: async ({ argText, reply }) => {
@@ -79,16 +100,21 @@ module.exports = [
     handler: async ({ argText, sock, jid, m, reply }) => {
       const u = (argText || '').match(/github\.com\/([\w.-]+)\/([\w.-]+)/);
       if (!u) return reply('Usage: .gitclone https://github.com/user/repo');
-      const zip = `https://codeload.github.com/${u[1]}/${u[2]}/zip/refs/heads/main`;
-      try {
-        const buf = await helpers.downloadToBuffer(zip, { timeout: 60000 });
-        await sock.sendMessage(jid, { document: buf, fileName: `${u[2]}.zip`, mimetype: 'application/zip' }, { quoted: m });
-      } catch {
-        const zip2 = `https://codeload.github.com/${u[1]}/${u[2]}/zip/refs/heads/master`;
-        const buf = await helpers.downloadToBuffer(zip2, { timeout: 60000 }).catch(() => null);
-        if (!buf) return reply('Could not fetch repo zip.');
-        await sock.sendMessage(jid, { document: buf, fileName: `${u[2]}.zip`, mimetype: 'application/zip' }, { quoted: m });
+      const tries = [
+        `https://codeload.github.com/${u[1]}/${u[2]}/zip/refs/heads/main`,
+        `https://codeload.github.com/${u[1]}/${u[2]}/zip/refs/heads/master`,
+        `https://api.github.com/repos/${u[1]}/${u[2]}/zipball`,
+      ];
+      for (const url of tries) {
+        try {
+          const buf = await helpers.downloadToBuffer(url, { timeout: 60000 });
+          if (buf && buf.length > 100) {
+            await sock.sendMessage(jid, { document: buf, fileName: `${u[2]}.zip`, mimetype: 'application/zip' }, { quoted: m });
+            return;
+          }
+        } catch (_) {}
       }
+      reply('Could not fetch repo zip — branch may not exist or repo is private.');
     },
   },
   {

@@ -204,18 +204,14 @@ module.exports = [
     name: 'reload', owner, description: 'Hot-reload command modules',
     handler: async ({ reply }) => {
       try {
-        for (const k of Object.keys(require.cache)) {
-          if (k.includes(path.sep + 'commands' + path.sep)) delete require.cache[k];
-        }
-        const handlerPath = require.resolve('../../handler');
-        delete require.cache[handlerPath];
-        require('../../handler');
-        reply('Reloaded all command modules.');
+        const handler = require('../../handler');
+        const r = handler.reload();
+        reply(`Reloaded — ${r.count} commands now active.`);
       } catch (e) { reply(`Reload failed: ${e?.message}`); }
     },
   },
   {
-    name: 'update', owner, description: 'Restart the bot process',
+    name: 'restart', aliases: ['restartbot'], owner, description: 'Restart the bot process',
     handler: async ({ reply }) => {
       await reply('Restarting…');
       setTimeout(() => process.exit(0), 600);

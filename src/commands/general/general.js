@@ -21,9 +21,19 @@ module.exports = [
   {
     name: 'ping',
     description: 'Latency',
-    handler: async ({ reply }) => {
+    handler: async ({ sock, jid, m }) => {
+      // True round-trip: send a placeholder, then edit it with the elapsed ms.
       const t = Date.now();
-      await reply(`Pong! ${Date.now() - t}ms (handler) / ${process.uptime().toFixed(1)}s uptime`);
+      const sent = await sock.sendMessage(jid, { text: '🏓 ...' }, { quoted: m });
+      const elapsed = Date.now() - t;
+      try {
+        await sock.sendMessage(jid, {
+          edit: sent.key,
+          text: `🏓 Pong! ${elapsed}ms round-trip · uptime ${process.uptime().toFixed(0)}s`,
+        });
+      } catch {
+        await sock.sendMessage(jid, { text: `🏓 Pong! ${elapsed}ms round-trip · uptime ${process.uptime().toFixed(0)}s` }, { quoted: m });
+      }
     },
   },
   {

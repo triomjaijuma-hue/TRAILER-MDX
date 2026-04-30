@@ -180,17 +180,59 @@ module.exports = [
     },
   },
   {
-    name: 'welcome', group, description: 'welcome on|off [text]',
+    name: 'welcome', group, description: 'welcome on|off [custom text]  ({user} {group} {count})',
     handler: async (ctx) => {
-      const s = store.get(); s.antitag[`welcome:${ctx.jid}`] = /on|true|1/i.test(ctx.argText);
-      store.set({ antitag: s.antitag }); ctx.reply(`welcome: ${s.antitag[`welcome:${ctx.jid}`] ? 'on' : 'off'}`);
+      const s = store.get();
+      const arg = (ctx.argText || '').trim();
+      const m = arg.match(/^(on|off|true|false|1|0)\b\s*([\s\S]*)$/i);
+      if (!m) return ctx.reply('Usage: .welcome on|off [text]\nPlaceholders: {user} {group} {count}');
+      const enabled = /on|true|1/i.test(m[1]);
+      const text = m[2].trim();
+      s.welcome[ctx.jid] = { enabled, text: text || s.welcome[ctx.jid]?.text || '' };
+      store.set({ welcome: s.welcome });
+      ctx.reply(`welcome: ${enabled ? 'on' : 'off'}${text ? `\nMessage: ${text}` : ''}`);
     },
   },
   {
-    name: 'goodbye', group, description: 'goodbye on|off [text]',
+    name: 'goodbye', group, description: 'goodbye on|off [custom text]  ({user} {group})',
     handler: async (ctx) => {
-      const s = store.get(); s.antitag[`goodbye:${ctx.jid}`] = /on|true|1/i.test(ctx.argText);
-      store.set({ antitag: s.antitag }); ctx.reply(`goodbye: ${s.antitag[`goodbye:${ctx.jid}`] ? 'on' : 'off'}`);
+      const s = store.get();
+      const arg = (ctx.argText || '').trim();
+      const m = arg.match(/^(on|off|true|false|1|0)\b\s*([\s\S]*)$/i);
+      if (!m) return ctx.reply('Usage: .goodbye on|off [text]\nPlaceholders: {user} {group}');
+      const enabled = /on|true|1/i.test(m[1]);
+      const text = m[2].trim();
+      s.goodbye[ctx.jid] = { enabled, text: text || s.goodbye[ctx.jid]?.text || '' };
+      store.set({ goodbye: s.goodbye });
+      ctx.reply(`goodbye: ${enabled ? 'on' : 'off'}${text ? `\nMessage: ${text}` : ''}`);
+    },
+  },
+  {
+    name: 'addbadword', description: 'Add a word to the global anti-badword list',
+    handler: async (ctx) => {
+      const w = (ctx.argText || '').trim().toLowerCase();
+      if (!w) return ctx.reply('Usage: .addbadword <word>');
+      const s = store.get();
+      if (!s.badwords.includes(w)) s.badwords.push(w);
+      store.set({ badwords: s.badwords });
+      ctx.reply(`Added. Total: ${s.badwords.length}`);
+    },
+  },
+  {
+    name: 'delbadword', description: 'Remove a word from the global anti-badword list',
+    handler: async (ctx) => {
+      const w = (ctx.argText || '').trim().toLowerCase();
+      const s = store.get();
+      s.badwords = s.badwords.filter(x => x !== w);
+      store.set({ badwords: s.badwords });
+      ctx.reply(`Done. Total: ${s.badwords.length}`);
+    },
+  },
+  {
+    name: 'listbadwords', description: 'Show the global anti-badword list',
+    handler: async (ctx) => {
+      const s = store.get();
+      ctx.reply(s.badwords.length ? '*Bad-words:*\n' + s.badwords.map(w => `• ${w}`).join('\n') : 'List is empty.');
     },
   },
   // ban / unban
