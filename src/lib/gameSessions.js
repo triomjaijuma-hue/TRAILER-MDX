@@ -95,6 +95,52 @@ function checkAnswer(jid, rawText) {
     return tttMove(jid, move);
   }
 
+  // --- quiz ---
+  const quizKey = `quiz:${jid}`;
+  if (sessions.has(quizKey)) {
+    const state = sessions.get(quizKey);
+    const { questions, current, score } = state;
+    const { q, a } = questions[current];
+
+    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const correct = normalize(text) === normalize(a);
+    const newScore = correct ? score + 1 : score;
+    const feedback = correct
+      ? `✅ Correct! *${a}* — +1 point!`
+      : `❌ Wrong! The answer was *${a}*`;
+
+    const next = current + 1;
+    if (next >= questions.length) {
+      sessions.delete(quizKey);
+      const pct = Math.round((newScore / questions.length) * 100);
+      const stars = '⭐'.repeat(Math.round(newScore / questions.length * 5));
+      const rating = pct >= 80 ? '🏆 Excellent! You\'re a genius!' :
+                     pct >= 60 ? '👍 Good job! Well done!' :
+                     pct >= 40 ? '🙂 Not bad — keep it up!' : '💪 Keep practising, you\'ll do better!';
+      return (
+        `${feedback}\n\n` +
+        `━━━━━━━━━━━━━━━━━\n` +
+        `🎓 *QUIZ COMPLETE!*\n` +
+        `━━━━━━━━━━━━━━━━━\n` +
+        `Score: *${newScore}/${questions.length}* (${pct}%)\n` +
+        `${stars || '—'}\n` +
+        `${rating}\n\n` +
+        `_Type *.quiz* to play again!_`
+      );
+    }
+
+    state.current = next;
+    state.score = newScore;
+    sessions.set(quizKey, state);
+    const nextQ = questions[next];
+    return (
+      `${feedback}\n\n` +
+      `*Question ${next + 1}/${questions.length}*\n` +
+      `🧠 ${nextQ.q}\n\n` +
+      `_Reply with your answer!_`
+    );
+  }
+
   return null;
 }
 
