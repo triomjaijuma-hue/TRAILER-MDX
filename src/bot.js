@@ -8,6 +8,8 @@ const {
   DisconnectReason,
   Browsers,
   makeCacheableSignalKeyStore,
+  downloadContentFromMessage,
+  generateMessageID,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const config = require('./lib/config');
@@ -26,6 +28,11 @@ let avatarApplied = false;
 // Map<chatJid, Map<msgId, { message, sender, timestamp, pushName }>>
 const messageCache = new Map();
 const MAX_PER_CHAT = 200;
+
+// Tracks revoke events we've already processed so a duplicate
+// messages.upsert (Baileys retransmits) doesn't fire anti-delete twice.
+const handledRevokes = new Set();
+const HANDLED_REVOKES_MAX = 1000;
 
 function rememberMessage(m) {
   try {
@@ -47,12 +54,15 @@ function rememberMessage(m) {
   } catch (_) {}
 }
 
+// IMPORTANT: do NOT delete from cache on recall. Baileys can deliver the
+// same revoke twice; we de-dupe via handledRevokes instead, and let the
+// per-chat LRU evict old messages naturally. Previous code dropped the
+// entry on first read, which broke duplicate revokes and made retries
+// silently lose the original payload.
 function recallMessage(chatJid, msgId) {
   const chatMap = messageCache.get(chatJid);
   if (!chatMap) return null;
-  const cached = chatMap.get(msgId);
-  if (cached) chatMap.delete(msgId);
-  return cached;
+  return chatMap.get(msgId) || null;
 }
 
 function hasSession() {
@@ -77,6 +87,40 @@ async function applyAvatar() {
     }
   } catch (e) {
     logger.warn({ err: e?.message }, 'failed to apply avatar');
+  }
+}
+
+// Re-upload media from a cached deleted message so the owner actually sees
+// the picture / sticker / voice note instead of a "[non-text]" placeholder.
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const c of stream) chunks.push(c);
+  return Buffer.concat(chunks);
+}
+
+async function rebuildMediaMessage(message) {
+  if (!message) return null;
+  const inner =
+    message.imageMessage      ? { kind: 'image',    node: message.imageMessage,    mediaType: 'image',    sendKey: 'image' } :
+    message.videoMessage      ? { kind: 'video',    node: message.videoMessage,    mediaType: 'video',    sendKey: 'video' } :
+    message.audioMessage      ? { kind: 'audio',    node: message.audioMessage,    mediaType: 'audio',    sendKey: 'audio' } :
+    message.stickerMessage    ? { kind: 'sticker',  node: message.stickerMessage,  mediaType: 'sticker',  sendKey: 'sticker' } :
+    message.documentMessage   ? { kind: 'document', node: message.documentMessage, mediaType: 'document', sendKey: 'document' } :
+    null;
+  if (!inner) return null;
+  try {
+    const stream = await downloadContentFromMessage(inner.node, inner.mediaType);
+    const buf = await streamToBuffer(stream);
+    if (!buf?.length) return null;
+    const out = { [inner.sendKey]: buf };
+    if (inner.node.caption)  out.caption  = inner.node.caption;
+    if (inner.node.mimetype) out.mimetype = inner.node.mimetype;
+    if (inner.kind === 'audio')  out.ptt = !!inner.node.ptt;
+    if (inner.kind === 'document') out.fileName = inner.node.fileName || 'file';
+    return out;
+  } catch (e) {
+    logger.warn({ err: e?.message }, 'rebuildMediaMessage failed');
+    return null;
   }
 }
 
@@ -160,10 +204,19 @@ async function start() {
     const msgId = proto.key?.id;
     if (!chat || !msgId) return;
 
+    // De-dupe: never process the same revoke twice.
+    const dedupeKey = `${chat}:${msgId}`;
+    if (handledRevokes.has(dedupeKey)) return;
+    handledRevokes.add(dedupeKey);
+    if (handledRevokes.size > HANDLED_REVOKES_MAX) {
+      const first = handledRevokes.values().next().value;
+      handledRevokes.delete(first);
+    }
+
     const cached = recallMessage(chat, msgId);
     if (!cached) return; // we never saw the original (e.g. bot was offline)
 
-    const ownerJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+    const ownerJid = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : null;
     if (!ownerJid) return;
 
     // Don't re-forward messages the bot itself sent or that the owner deleted.
@@ -182,16 +235,37 @@ async function start() {
     const mentions = [cached.sender, deleterJid].filter(Boolean);
 
     await sock.sendMessage(ownerJid, { text: header, mentions }).catch(() => {});
-    // Re-deliver the original message content to the owner
-    await sock.relayMessage(ownerJid, cached.message, {}).catch(async () => {
-      const txt =
-        cached.message.conversation ||
-        cached.message.extendedTextMessage?.text ||
-        cached.message.imageMessage?.caption ||
-        cached.message.videoMessage?.caption ||
-        '[non-text content could not be re-sent]';
+
+    // 1) Re-upload any media so the owner actually sees the image / sticker /
+    //    voice note instead of a placeholder. This was the main bug — the old
+    //    code called sock.relayMessage without a messageId, which always
+    //    threw, and the catch fell through to a text-only stub.
+    const media = await rebuildMediaMessage(cached.message);
+    if (media) {
+      await sock.sendMessage(ownerJid, media).catch((e) => {
+        logger.warn({ err: e?.message }, 'antidelete media re-send failed');
+      });
+      return;
+    }
+
+    // 2) Plain text fallback (covers conversation / extendedTextMessage).
+    const txt =
+      cached.message.conversation ||
+      cached.message.extendedTextMessage?.text ||
+      cached.message.imageMessage?.caption ||
+      cached.message.videoMessage?.caption ||
+      '';
+    if (txt) {
       await sock.sendMessage(ownerJid, { text: '```' + txt + '```' }).catch(() => {});
-    });
+      return;
+    }
+
+    // 3) Last-resort relay attempt with a freshly generated message id.
+    try {
+      await sock.relayMessage(ownerJid, cached.message, { messageId: generateMessageID() });
+    } catch (e) {
+      await sock.sendMessage(ownerJid, { text: '_[deleted message could not be re-sent]_' }).catch(() => {});
+    }
   }
 
   sock.ev.on('messages.upsert', async (ev) => {

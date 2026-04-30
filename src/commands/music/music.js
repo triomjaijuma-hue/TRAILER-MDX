@@ -7,11 +7,23 @@ const ytdlOriginal = require('ytdl-core');
 const axios = require('axios');
 const helpers = require('../../lib/helpers');
 
+// WhatsApp's media upload practical ceiling is ~16 MB for inline audio/video.
+// We hard-cap to be safe and tell the user to use the link instead when over.
+const MAX_MEDIA_BYTES = 14 * 1024 * 1024;
+
+// Cobalt v10 instances. The community mirrors that used to be public
+// (co.wuk.sh, capi.oak.li) are dead/intermittent. We keep only sources
+// that actually answer in 2026.
+const COBALT_INSTANCES = [
+  'https://api.cobalt.tools/api/json',  // legacy v7-compatible JSON endpoint
+  'https://api.cobalt.tools',           // v10
+];
+
 // Pick the result that best matches the query, instead of blindly
 // taking the first hit (which is often a remix / cover / reaction).
 async function search(q) {
-  const r = await yts(q);
-  const vids = r.videos || [];
+  const r = await ytSearchSafe(q);
+  const vids = r?.videos || [];
   if (!vids.length) return null;
 
   const tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
@@ -23,18 +35,14 @@ async function search(q) {
       if (title.includes(t)) score += 3;
       if (author.includes(t)) score += 2;
     }
-    // Prefer official uploads and the artist's auto-generated "Topic" channel
     if (/official\s+(audio|video|music)/i.test(v.title)) score += 3;
     if (/lyrics?/i.test(v.title)) score += 1;
     if (/\btopic\b|vevo/i.test(v.author?.name || '')) score += 3;
-    // Penalize obviously-not-the-song results
     if (/reaction|tutorial|cover|how to play|guitar lesson|piano lesson|sped\s*up|nightcore|slowed/i.test(v.title)) score -= 3;
     if (/mix|playlist|hours?/i.test(v.title)) score -= 1;
-    // Prefer realistic song durations (45s – 12 min)
     const sec = v.duration?.seconds || 0;
     if (sec >= 45 && sec <= 720) score += 1;
     else if (sec > 720) score -= 2;
-    // Slight tie-break: prefer more views
     score += Math.min(3, Math.log10((v.views || 1) + 1) / 2);
     return score;
   };
@@ -45,6 +53,53 @@ async function search(q) {
   return ranked[0]?.v || vids[0];
 }
 
+// yt-search occasionally throws after YouTube tweaks its initialData
+// payload. Wrap it and fall back to scraping the search results page so
+// .ytsearch / .play don't dead-end on a TypeError.
+async function ytSearchSafe(query) {
+  try {
+    return await yts(query);
+  } catch (e) {
+    return await ytSearchScrape(query);
+  }
+}
+
+async function ytSearchScrape(query) {
+  const html = await helpers.getText(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`, { timeout: 15000 });
+  const m = html.match(/var ytInitialData = (\{[\s\S]*?\});/);
+  if (!m) return { videos: [] };
+  let data;
+  try { data = JSON.parse(m[1]); } catch { return { videos: [] }; }
+  const out = [];
+  const sections = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+  for (const sec of sections) {
+    const items = sec?.itemSectionRenderer?.contents || [];
+    for (const it of items) {
+      const v = it?.videoRenderer;
+      if (!v?.videoId) continue;
+      const title = v.title?.runs?.[0]?.text || '';
+      const lengthText = v.lengthText?.simpleText || '';
+      const seconds = (() => {
+        const parts = lengthText.split(':').map(Number);
+        if (parts.some(isNaN)) return 0;
+        return parts.reduce((a, b) => a * 60 + b, 0);
+      })();
+      out.push({
+        title,
+        videoId: v.videoId,
+        url: `https://www.youtube.com/watch?v=${v.videoId}`,
+        author: { name: v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || '' },
+        duration: { seconds, timestamp: lengthText },
+        timestamp: lengthText,
+        views: Number((v.viewCountText?.simpleText || '0').replace(/\D/g, '')) || 0,
+      });
+      if (out.length >= 20) break;
+    }
+    if (out.length >= 20) break;
+  }
+  return { videos: out };
+}
+
 // Try multiple strategies to get an audio buffer for a YouTube URL.
 async function fetchAudio(url) {
   const errors = [];
@@ -52,40 +107,97 @@ async function fetchAudio(url) {
   // Strategy 1: @distube/ytdl-core (maintained)
   try {
     const stream = ytdlDistube(url, { filter: 'audioonly', quality: 'highestaudio' });
-    const chunks = [];
-    for await (const c of stream) chunks.push(c);
-    const buf = Buffer.concat(chunks);
-    if (buf.length > 1024) return { buf, source: '@distube/ytdl-core' };
+    const buf = await streamWithCap(stream, MAX_MEDIA_BYTES);
+    if (buf && buf.length > 1024) return { buf, source: '@distube/ytdl-core' };
   } catch (e) { errors.push(`distube: ${e.message}`); }
 
   // Strategy 2: original ytdl-core
   try {
     const stream = ytdlOriginal(url, { filter: 'audioonly', quality: 'highestaudio' });
-    const chunks = [];
-    for await (const c of stream) chunks.push(c);
-    const buf = Buffer.concat(chunks);
-    if (buf.length > 1024) return { buf, source: 'ytdl-core' };
+    const buf = await streamWithCap(stream, MAX_MEDIA_BYTES);
+    if (buf && buf.length > 1024) return { buf, source: 'ytdl-core' };
   } catch (e) { errors.push(`ytdl: ${e.message}`); }
 
-  // Strategy 3: Cobalt v10 public API (no key required) with multi-instance fallback.
-  const cobaltInstances = ['https://api.cobalt.tools', 'https://co.wuk.sh', 'https://capi.oak.li'];
-  for (const base of cobaltInstances) {
+  // Strategy 3: Cobalt
+  for (const base of COBALT_INSTANCES) {
     try {
       const r = await axios.post(
-        `${base}/`,
+        base,
         { url, downloadMode: 'audio', audioFormat: 'mp3' },
-        { timeout: 30000, headers: { Accept: 'application/json', 'Content-Type': 'application/json' } }
+        { timeout: 30000, headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, validateStatus: () => true }
       );
       const direct = r.data?.url || r.data?.audio;
       if (direct) {
-        const audio = await axios.get(direct, { responseType: 'arraybuffer', timeout: 60000 });
+        const audio = await axios.get(direct, { responseType: 'arraybuffer', timeout: 60000, maxContentLength: MAX_MEDIA_BYTES, maxBodyLength: MAX_MEDIA_BYTES });
         const buf = Buffer.from(audio.data);
         if (buf.length > 1024) return { buf, source: `cobalt(${base.replace('https://', '')})` };
+      } else if (r.data?.status === 'error') {
+        errors.push(`cobalt(${base}): ${r.data?.error?.code || 'error'}`);
       }
     } catch (e) { errors.push(`cobalt(${base}): ${e.message}`); }
   }
 
   throw new Error(errors.join(' | ') || 'no working audio source');
+}
+
+// Read a stream into a buffer but bail out cleanly once we exceed `cap`.
+// Prevents OOM and silent WhatsApp upload failures on long videos.
+async function streamWithCap(stream, cap) {
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    stream.on('data', (c) => {
+      total += c.length;
+      if (total > cap) {
+        try { stream.destroy(); } catch (_) {}
+        return reject(new Error(`media exceeds ${Math.round(cap / 1024 / 1024)} MB limit`));
+      }
+      chunks.push(c);
+    });
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+async function fetchVideo(url) {
+  const errors = [];
+
+  // 360p mp4 (smaller, more likely to actually upload to WhatsApp).
+  const filter = (format) =>
+    format.container === 'mp4' && format.hasVideo && format.hasAudio &&
+    (!format.height || format.height <= 360);
+
+  try {
+    const stream = ytdlDistube(url, { quality: 'highest', filter });
+    const buf = await streamWithCap(stream, MAX_MEDIA_BYTES);
+    if (buf?.length > 1024) return { buf, source: '@distube/ytdl-core' };
+  } catch (e) { errors.push(`distube: ${e.message}`); }
+
+  try {
+    const stream = ytdlOriginal(url, { quality: 'highest', filter });
+    const buf = await streamWithCap(stream, MAX_MEDIA_BYTES);
+    if (buf?.length > 1024) return { buf, source: 'ytdl-core' };
+  } catch (e) { errors.push(`ytdl: ${e.message}`); }
+
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const r = await axios.post(
+        base,
+        { url, downloadMode: 'auto', videoQuality: '360' },
+        { timeout: 30000, headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, validateStatus: () => true }
+      );
+      const direct = r.data?.url;
+      if (direct) {
+        const v = await axios.get(direct, { responseType: 'arraybuffer', timeout: 90000, maxContentLength: MAX_MEDIA_BYTES, maxBodyLength: MAX_MEDIA_BYTES });
+        const buf = Buffer.from(v.data);
+        if (buf.length > 1024) return { buf, source: `cobalt(${base.replace('https://', '')})` };
+      } else if (r.data?.status === 'error') {
+        errors.push(`cobalt(${base}): ${r.data?.error?.code || 'error'}`);
+      }
+    } catch (e) { errors.push(`cobalt(${base}): ${e.message}`); }
+  }
+
+  throw new Error(errors.join(' | ') || 'no working video source');
 }
 
 module.exports = [
@@ -94,10 +206,14 @@ module.exports = [
     description: 'YouTube search',
     handler: async ({ argText, reply }) => {
       if (!argText) return reply('Usage: .ytsearch <query>');
-      const r = await yts(argText);
-      const top = (r.videos || []).slice(0, 6);
-      if (!top.length) return reply('Nothing found.');
-      reply(top.map(v => `• ${v.title}\n  ${v.timestamp} · ${v.author?.name}\n  ${v.url}`).join('\n\n'));
+      try {
+        const r = await ytSearchSafe(argText);
+        const top = (r?.videos || []).slice(0, 6);
+        if (!top.length) return reply('Nothing found.');
+        reply(top.map(v => `• ${v.title}\n  ${v.timestamp || (v.duration?.timestamp || '')} · ${v.author?.name || ''}\n  ${v.url}`).join('\n\n'));
+      } catch (e) {
+        reply(`YouTube search failed: ${e?.message?.slice(0, 200) || 'unknown'}`);
+      }
     },
   },
   {
@@ -109,14 +225,14 @@ module.exports = [
       const v = await search(argText);
       if (!v) return reply('Not found on YouTube.');
       try {
-        const { buf, source } = await fetchAudio(v.url);
+        const { buf } = await fetchAudio(v.url);
         await sock.sendMessage(jid, {
           audio: buf,
           mimetype: 'audio/mp4',
           ptt: false,
           fileName: `${v.title}.mp3`,
         }, { quoted: m });
-        await reply(`🎵 *${v.title}*\n${v.author?.name} · ${v.timestamp}\n${v.url}`);
+        await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || v.duration?.timestamp || ''}\n${v.url}`);
       } catch (e) {
         reply(`❌ All audio sources failed.\n\n*${v.title}*\n${v.url}\n\nTip: try \`.ytmp4 ${argText}\` for video, or open the link directly.\n_Reason: ${e.message?.slice(0, 200)}_`);
       }
@@ -131,13 +247,10 @@ module.exports = [
       const v = await search(argText);
       if (!v) return reply('Not found on YouTube.');
       try {
-        const stream = ytdlDistube(v.url, { quality: 'highestvideo', filter: format => format.container === 'mp4' && format.hasVideo && format.hasAudio });
-        const chunks = [];
-        for await (const c of stream) chunks.push(c);
-        const buf = Buffer.concat(chunks);
+        const { buf } = await fetchVideo(v.url);
         await sock.sendMessage(jid, { video: buf, mimetype: 'video/mp4', caption: v.title }, { quoted: m });
       } catch (e) {
-        reply(`❌ Video fetch failed.\n*${v.title}*\n${v.url}\n_${e.message?.slice(0, 200)}_`);
+        reply(`❌ Video fetch failed.\n*${v.title}*\n${v.url}\n_${e.message?.slice(0, 200)}_\n\n_Tip: long videos exceed WhatsApp's upload limit — try \`.play ${argText}\` for audio only._`);
       }
     },
   },

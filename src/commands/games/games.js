@@ -12,7 +12,28 @@ const truths = ['What is your worst habit?', 'Last lie you told?', 'Biggest fear
 const dares = ['Send a 30s voice note singing.', 'Text your crush "hi" right now.', 'Push-ups: 10 — go.'];
 const sessions = new Map(); // jid -> game state
 
+const GAME_LIST = [
+  { cmd: '.dado',       desc: '🎲 Roll a dice (alias: .dice)' },
+  { cmd: '.truth',      desc: '🤔 Random truth question' },
+  { cmd: '.dare',       desc: '😈 Random dare' },
+  { cmd: '.trivia',     desc: '🧠 Trivia question' },
+  { cmd: '.math',       desc: '🧮 Math problem' },
+  { cmd: '.hangman',    desc: '🪢 Start a hangman game' },
+  { cmd: '.tictactoe',  desc: '⭕ Show a tic-tac-toe board' },
+];
+
+function gameMenu() {
+  const lines = ['🎮 *GAMES MENU*', '', 'Pick one of:'];
+  for (const g of GAME_LIST) lines.push(`  ${g.cmd}  —  ${g.desc}`);
+  lines.push('', '_Tip:_ type a command above to play.');
+  return lines.join('\n');
+}
+
 module.exports = [
+  // NEW: a real .game / .games command so users typing .game stop being
+  // routed to the image fetcher. This replaces the old behaviour where
+  // .game was hijacked by commands/images/images.js.
+  { name: 'game',  aliases: ['games'], description: 'Show available games', handler: async ({ reply }) => reply(gameMenu()) },
   { name: 'dado', aliases: ['dice'], description: 'Roll a dice', handler: async ({ reply }) => reply(`🎲 You rolled: ${1 + Math.floor(Math.random()*6)}`) },
   { name: 'dare', description: 'Random dare', handler: async ({ reply }) => reply(helpers.pickRandom(dares)) },
   { name: 'truth', description: 'Random truth', handler: async ({ reply }) => reply(helpers.pickRandom(truths)) },

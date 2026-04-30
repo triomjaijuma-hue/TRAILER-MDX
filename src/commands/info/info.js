@@ -2,6 +2,18 @@
 const helpers = require('../../lib/helpers');
 const config = require('../../lib/config');
 
+// Small helper: try a JSON request and treat 404/empty as "not found"
+// instead of bubbling up as a generic "Failed: status code 404" message.
+async function safeGetJson(url, opts = {}) {
+  try {
+    return { ok: true, data: await helpers.getJson(url, opts) };
+  } catch (e) {
+    const status = e?.response?.status;
+    if (status === 404) return { ok: false, notFound: true };
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
 module.exports = [
   { name: 'owner', description: 'Bot owner contact', handler: async ({ sock, jid, m }) => {
     const num = config.ownerNumber;
@@ -17,14 +29,39 @@ module.exports = [
       reply((d.results || []).map(r => `• ${r.trackName} — ${r.artistName}\n  ${r.trackViewUrl}`).join('\n\n') || 'No results.');
     } catch (e) { reply(`Failed: ${e?.message}`); }
   } },
+
+  // .medicine — openFDA returns 404 when there is no match, which the old
+  // code surfaced as "Failed: Request failed with status code 404". We now
+  // treat 404 as "not found" and fall back from brand_name -> generic_name
+  // so common generics (paracetamol, ibuprofen, ...) actually resolve.
   { name: 'medicine', description: 'Drug info (openFDA)', handler: async ({ argText, reply }) => {
-    try {
-      const d = await helpers.getJson(`https://api.fda.gov/drug/label.json?search=openfda.brand_name:%22${encodeURIComponent(argText)}%22&limit=1`);
-      const r = d.results?.[0];
-      if (!r) return reply('Not found.');
-      reply(`*${r.openfda?.brand_name?.[0] || argText}*\nPurpose: ${r.purpose?.[0] || '?'}\nUsage: ${(r.indications_and_usage?.[0] || '').slice(0, 600)}…`);
-    } catch (e) { reply(`Failed: ${e?.message}`); }
+    const q = (argText || '').trim();
+    if (!q) return reply('Usage: .medicine <drug name>');
+    const enc = encodeURIComponent(`"${q}"`);
+    let r = await safeGetJson(`https://api.fda.gov/drug/label.json?search=openfda.brand_name:${enc}&limit=1`);
+    if (r.ok && !r.data?.results?.length) r = { ok: false, notFound: true };
+    if (!r.ok && (r.notFound || r.error)) {
+      const r2 = await safeGetJson(`https://api.fda.gov/drug/label.json?search=openfda.generic_name:${enc}&limit=1`);
+      if (r2.ok && r2.data?.results?.length) r = r2;
+    }
+    if (!r.ok || !r.data?.results?.length) {
+      return reply(`💊 No drug info found for *${q}*. Try a different spelling or a generic name (e.g. ibuprofen).`);
+    }
+    const d = r.data.results[0];
+    const brand = d.openfda?.brand_name?.[0] || d.openfda?.generic_name?.[0] || q;
+    const purpose = (d.purpose?.[0] || d.indications_and_usage?.[0] || '').trim();
+    const usage   = (d.indications_and_usage?.[0] || '').trim();
+    const warn    = (d.warnings?.[0] || d.warnings_and_cautions?.[0] || '').trim();
+    const trim = (s, n) => s ? (s.length > n ? s.slice(0, n) + '…' : s) : '_(none provided)_';
+    reply(
+      `💊 *${brand}*\n\n` +
+      `*Purpose:* ${trim(purpose, 400)}\n\n` +
+      `*Usage:* ${trim(usage, 600)}\n\n` +
+      `*Warnings:* ${trim(warn, 500)}\n\n` +
+      `_Source: openFDA — informational only, not medical advice._`
+    );
   } },
+
   { name: 'momo', description: 'Mobile money disclaimer', handler: async ({ reply }) => reply('No mobile-money integration is enabled by default. Hook up a provider via env vars.') },
   { name: 'pokedex', description: 'Pokemon info', handler: async ({ argText, reply }) => {
     if (!argText) return reply('Usage: .pokedex <name>');
@@ -48,10 +85,8 @@ module.exports = [
   } },
   { name: 'trends', description: 'Google Trends — top searches', handler: async ({ argText, reply }) => {
     if (!argText || !argText.trim()) {
-      // Show top daily trends from Google Trends RSS
       try {
-        const helpersLib = require('../../lib/helpers');
-        const xml = await helpersLib.getText('https://trends.google.com/trends/trendingsearches/daily/rss?geo=US');
+        const xml = await helpers.getText('https://trends.google.com/trends/trendingsearches/daily/rss?geo=US');
         const titles = [...xml.matchAll(/<title>([^<]+)<\/title>/g)].slice(1, 11).map(m => m[1]);
         if (titles.length) return reply(`📈 *Top Trending Now (US)*\n\n${titles.map((t, i) => `${i + 1}. ${t}`).join('\n')}\n\n_Tip: \`.trends <topic>\` for a specific search._`);
       } catch (_) {}
@@ -76,5 +111,36 @@ module.exports = [
       reply(`*${argText}*\nStatus: ${(d.status || []).join(', ')}\nRegistrar: ${(d.entities?.[0]?.vcardArray?.[1]?.find(x=>x[0]==='fn')?.[3]) || '?'}\nNS: ${(d.nameservers || []).map(n=>n.ldhName).join(', ').slice(0, 300)}`);
     } catch (e) { reply(`Failed: ${e?.message}`); }
   } },
-  { name: 'news', description: 'Top headlines (Google News RSS link)', handler: async ({ argText, reply }) => reply(`https://news.google.com/search?q=${encodeURIComponent(argText || 'world')}`) },
+
+  // .news — used to just echo a search URL. Now actually fetches the
+  // top headlines from Google News RSS and sends them inline. Falls back
+  // to the search link if the RSS feed is unreachable.
+  { name: 'news', description: 'Top headlines (Google News)', handler: async ({ argText, reply }) => {
+    const q = (argText || '').trim();
+    const feedUrl = q
+      ? `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`
+      : `https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en`;
+    try {
+      const xml = await helpers.getText(feedUrl, { timeout: 15000 });
+      const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 8);
+      if (!items.length) throw new Error('no items');
+      const parsed = items.map(([, body]) => {
+        const pick = (tag) => {
+          const m = body.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`));
+          if (!m) return '';
+          let v = m[1].trim();
+          if (v.startsWith('<![CDATA[')) v = v.slice(9, -3);
+          return v;
+        };
+        return { title: pick('title'), link: pick('link'), source: pick('source'), pubDate: pick('pubDate') };
+      });
+      const heading = q ? `📰 *Top News: ${q}*` : '📰 *Top Headlines*';
+      const out = [heading, '', ...parsed.map((it, i) =>
+        `${i + 1}. *${it.title}*${it.source ? `\n   _${it.source}_` : ''}\n   ${it.link}`
+      )].join('\n\n');
+      reply(out.slice(0, 4000));
+    } catch (_) {
+      reply(`📰 News feed unreachable. Search link:\nhttps://news.google.com/search?q=${encodeURIComponent(q || 'world')}`);
+    }
+  } },
 ];

@@ -2,13 +2,12 @@
 const helpers = require('../../lib/helpers');
 const axios = require('axios');
 
-// Cobalt v10 changed the API. There is no single canonical free instance any
-// more — try the official one, then a couple of community mirrors. Body schema
-// changed too: {url, downloadMode, audioFormat, videoQuality}.
+// Cobalt v10 changed the API. The community mirrors that used to be public
+// (co.wuk.sh, capi.oak.li) are now dead. We keep only sources that actually
+// answer in 2026 and accept a 4xx/5xx instead of crashing the request.
 const COBALT_INSTANCES = [
-  'https://api.cobalt.tools',
-  'https://co.wuk.sh',
-  'https://capi.oak.li',
+  'https://api.cobalt.tools/api/json',  // legacy v7-compatible JSON endpoint
+  'https://api.cobalt.tools',           // v10
 ];
 
 async function cobaltResolve(targetUrl, audioOnly = false) {
@@ -18,9 +17,10 @@ async function cobaltResolve(targetUrl, audioOnly = false) {
   let lastErr;
   for (const base of COBALT_INSTANCES) {
     try {
-      const r = await axios.post(`${base}/`, body, {
+      const r = await axios.post(base, body, {
         timeout: 25000,
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        validateStatus: () => true,
       });
       const d = r.data;
       // v10: { status: 'redirect'|'tunnel'|'picker'|'error', url, picker }
@@ -29,6 +29,7 @@ async function cobaltResolve(targetUrl, audioOnly = false) {
       if (d?.url) return { url: d.url };
       if (d?.audio) return { url: d.audio };
       if (Array.isArray(d?.picker) && d.picker.length) return { picker: d.picker.map(p => p.url).filter(Boolean).slice(0, 5) };
+      lastErr = new Error(`cobalt http ${r.status}`);
     } catch (e) {
       lastErr = e;
     }
