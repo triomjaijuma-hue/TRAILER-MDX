@@ -70,6 +70,78 @@ async function reply(sock, m, content) {
   return sock.sendMessage(jid, content, { quoted: m });
 }
 
+// Per-category title shown in the top of the banner. The category comes
+// straight from the plugin folder name (admin/ -> ADMIN, etc.). If a new
+// category folder is added we just fall back to the raw name.
+const CATEGORY_TITLE = {
+  ADMIN:    'ADMIN PANEL',
+  AI:       'AI ASSISTANT',
+  ANIME:    'ANIME ZONE',
+  AUDIOFX:  'AUDIO EFFECTS',
+  DOWNLOAD: 'DOWNLOADER',
+  EPHOTO:   'PHOTO EFFECTS',
+  FUN:      'FUN & GAMES',
+  GAMES:    'GAMES',
+  GENERAL:  'GENERAL',
+  GROUP:    'GROUP TOOLS',
+  IMAGES:   'IMAGE TOOLS',
+  INFO:     'INFORMATION',
+  MENU:     'MENU',
+  MUSIC:    'MUSIC',
+  NOTES:    'NOTES',
+  OWNER:    'OWNER ZONE',
+  PRIVACY:  'PRIVACY',
+  QUOTES:   'QUOTES',
+  SEARCH:   'SEARCH',
+  STALK:    'STALKER TOOLS',
+  STICKERS: 'STICKER MAKER',
+  TEXT:     'TEXT STYLES',
+  TOOLS:    'UTILITIES',
+  UPLOAD:   'UPLOADER',
+  UTILITY:  'UTILITY',
+};
+
+function bannerWrap(category, body) {
+  const title = CATEGORY_TITLE[category] || category || 'COMMAND';
+  const top = `╭━━━〔 *${title}* 〕━━━╮`;
+  const bot = `╰━━━〔 *${config.botName}* 〕━━━╯`;
+  // Don't double-wrap: if a command already produced a banner (e.g. menus),
+  // leave it alone.
+  if (typeof body === 'string' && body.includes('╭━━━〔')) return body;
+  const safe = (body == null ? '' : String(body));
+  return `${top}\n${safe}\n${bot}`;
+}
+
+// Wrap a command's ctx.reply() so every text response and every media
+// caption gets the category banner. Stickers/reactions/edits are skipped
+// because adding a caption to them is either invalid or just noise.
+function makeBannerReply(sock, m, category) {
+  return async (content) => {
+    if (typeof content === 'string') {
+      return reply(sock, m, bannerWrap(category, content));
+    }
+    if (content && typeof content === 'object') {
+      // Pass-through cases that don't take a caption.
+      if (content.sticker || content.react || content.edit || content.delete) {
+        return reply(sock, m, content);
+      }
+      if (typeof content.text === 'string') {
+        return reply(sock, m, { ...content, text: bannerWrap(category, content.text) });
+      }
+      if (typeof content.caption === 'string') {
+        return reply(sock, m, { ...content, caption: bannerWrap(category, content.caption) });
+      }
+      // Media without an explicit caption — add one so it still gets a banner.
+      if (content.image || content.video || content.document || content.audio) {
+        // Audio is usually a voice note; only banner if not a voice note.
+        if (content.audio && content.ptt) return reply(sock, m, content);
+        return reply(sock, m, { ...content, caption: bannerWrap(category, '') });
+      }
+    }
+    return reply(sock, m, content);
+  };
+}
+
 function buildContext(sock, m) {
   const jid = m.key.remoteJid;
   const isGroup = jid.endsWith('@g.us');
@@ -180,7 +252,16 @@ async function onMessages(sock, ev) {
     if (s.cmdReact) ctx.react('⏳');
 
     try {
-      await resolved.handler({ ...ctx, args, argText, prefix: parsed.prefix, command: cmdName });
+      const bannerReply = makeBannerReply(sock, m, resolved.category);
+      await resolved.handler({
+        ...ctx,
+        reply: bannerReply,
+        args,
+        argText,
+        prefix: parsed.prefix,
+        command: cmdName,
+        category: resolved.category,
+      });
       if (s.cmdReact) ctx.react('✅');
     } catch (e) {
       logger.error({ err: e?.stack || e?.message, command: cmdName }, 'command failed');
