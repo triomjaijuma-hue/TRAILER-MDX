@@ -281,14 +281,13 @@ async function start() {
     const senderName = cached.pushName || cached.sender?.split('@')[0] || 'unknown';
     const when = new Date((Number(cached.timestamp) || Date.now() / 1000) * 1000).toLocaleString();
     const senderShort = (cached.sender || '').split('@')[0];
-    const deleterShort = (deleterJid || '').split('@')[0];
     const chatLabel = await prettyChat(chat, cached.pushName);
     const header =
-      `🛡️ *ANTI-DELETE*\n\n` +
       `*Sender:* @${senderShort} (${senderName})\n` +
-      (deleterShort && deleterShort !== senderShort ? `*Deleted by:* @${deleterShort}\n` : '') +
-      `*Chat:* ${chatLabel}\n*Sent:* ${when}\n\n_Original message:_`;
-    const mentions = [cached.sender, deleterJid].filter(Boolean);
+      `*Chat:* ${chatLabel}\n` +
+      `*Sent:* ${when}\n` +
+      `*Deleted message:*`;
+    const mentions = [cached.sender].filter(Boolean);
 
     await sock.sendMessage(ownerJid, { text: header, mentions }).catch(() => {});
 
