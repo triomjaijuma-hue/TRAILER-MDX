@@ -90,6 +90,27 @@ function recallMessage(chatJid, msgId) {
   return chatMap.get(msgId) || null;
 }
 
+// Turn raw JIDs (123@s.whatsapp.net, 182145754603609@lid, 12345-6789@g.us)
+// into something a human reading the antidelete card can actually parse.
+async function prettyChat(jid, fallbackName) {
+  if (!jid || typeof jid !== 'string') return 'unknown';
+  if (jid.endsWith('@g.us')) {
+    try {
+      const meta = await sock.groupMetadata(jid);
+      if (meta?.subject) return meta.subject;
+    } catch (_) {}
+    return 'Group chat';
+  }
+  if (jid.endsWith('@s.whatsapp.net')) {
+    const num = jid.split('@')[0];
+    return num ? '+' + num : 'Private chat';
+  }
+  if (jid.endsWith('@lid')) {
+    return fallbackName ? `Chat with ${fallbackName}` : 'Private chat';
+  }
+  return jid;
+}
+
 function hasSession() {
   try {
     return fs.existsSync(path.join(config.paths.auth, 'creds.json'));
@@ -261,11 +282,12 @@ async function start() {
     const when = new Date((Number(cached.timestamp) || Date.now() / 1000) * 1000).toLocaleString();
     const senderShort = (cached.sender || '').split('@')[0];
     const deleterShort = (deleterJid || '').split('@')[0];
+    const chatLabel = await prettyChat(chat, cached.pushName);
     const header =
       `🛡️ *ANTI-DELETE*\n\n` +
       `*Sender:* @${senderShort} (${senderName})\n` +
       (deleterShort && deleterShort !== senderShort ? `*Deleted by:* @${deleterShort}\n` : '') +
-      `*Chat:* ${chat}\n*Sent:* ${when}\n\n_Original message:_`;
+      `*Chat:* ${chatLabel}\n*Sent:* ${when}\n\n_Original message:_`;
     const mentions = [cached.sender, deleterJid].filter(Boolean);
 
     await sock.sendMessage(ownerJid, { text: header, mentions }).catch(() => {});
