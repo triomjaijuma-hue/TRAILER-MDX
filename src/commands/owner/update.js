@@ -22,6 +22,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
+const sessionBackup = require('../../lib/sessionBackup');
+
+// Wraps process.exit so we always flush the encrypted session backup to
+// GitHub first. Without this, .update / .restart / .redeploy on a host
+// without persistent storage would lose the very session change that just
+// happened in the last 30 seconds.
+async function exitAfterFlush(code, ms) {
+  setTimeout(async () => {
+    try { await sessionBackup.flush(); } catch (_) {}
+    process.exit(code);
+  }, ms);
+}
 
 const owner = true;
 
@@ -257,11 +269,12 @@ module.exports = [
         if (!r.ok) {
           return reply(`❌ Hot-update failed: ${r.message}\n\n_Try \`.redeploy\` for a full Railway rebuild instead._`);
         }
-        await reply(`✅ Updated ${r.touched} top-level paths${r.depSummary}.\n♻️ Restarting in 2s — pairing is preserved.`);
-        // Give the message time to flush, then exit.
-        // Railway's restart policy (ALWAYS) brings the process back up
-        // inside the same container, so auth_info/ is still there.
-        setTimeout(() => process.exit(0), 2000);
+        await reply(`✅ Updated ${r.touched} top-level paths${r.depSummary}.\n♻️ Restarting in 2s — session backup is being flushed before exit.`);
+        // Flush the encrypted session backup to GitHub, then exit. On the
+        // next start, sessionBackup.restore() pulls it back into auth_info/
+        // before Baileys looks for creds — so pairing is preserved even on
+        // ephemeral hosts that destroy the container on restart.
+        exitAfterFlush(0, 2000);
       } catch (e) {
         reply(`❌ Hot-update error: ${e?.message || e}`);
       }
@@ -271,8 +284,8 @@ module.exports = [
     name: 'restart', aliases: ['reboot'], owner,
     description: 'Restart the bot process (no code change)',
     handler: async ({ reply }) => {
-      await reply('🔁 Restarting in 2s...');
-      setTimeout(() => process.exit(0), 2000);
+      await reply('🔁 Restarting in 2s — flushing session backup before exit.');
+      exitAfterFlush(0, 2000);
     },
   },
   {
@@ -286,8 +299,8 @@ module.exports = [
       try {
         const result = await railwayRedeploy();
         if (result.ok) {
-          await reply(header + '✅ Redeploy triggered. Bot will be back online in ~30s with a fresh container.');
-          setTimeout(() => process.exit(0), 3000);
+          await reply(header + '✅ Redeploy triggered. Bot will be back online in ~30s with a fresh container (session restored from backup).');
+          exitAfterFlush(0, 3000);
           return;
         }
         return reply(header + result.message);
