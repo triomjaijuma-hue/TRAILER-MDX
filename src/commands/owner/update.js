@@ -61,6 +61,47 @@ async function latestCommit() {
   }
 }
 
+// Pull the last N commits on the configured branch — used by .changelog so
+// the owner can see what an .update is about to apply before pulling it.
+async function recentCommits(n = 5) {
+  try {
+    const r = await axios.get(
+      `https://api.github.com/repos/${REPO_USER}/${REPO_NAME}/commits`,
+      {
+        timeout: 10000,
+        headers: { 'User-Agent': 'TRAILER-MDX' },
+        params: { sha: REPO_BRANCH, per_page: n },
+      }
+    );
+    return (r.data || []).map((c) => ({
+      sha: c.sha?.slice(0, 7),
+      message: (c.commit?.message || '').split('\n')[0],
+      author: c.commit?.author?.name || c.author?.login || 'unknown',
+      date: c.commit?.author?.date || c.commit?.committer?.date,
+    }));
+  } catch (_) {
+    return null;
+  }
+}
+
+// "2h ago" / "3d ago" — small helper so the changelog reads naturally.
+function relativeTime(iso) {
+  if (!iso) return '';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 0 || isNaN(ms)) return '';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60)         return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60)         return `${min}m ago`;
+  const hr  = Math.floor(min / 60);
+  if (hr  < 24)         return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30)         return `${day}d ago`;
+  const mo  = Math.floor(day / 30);
+  if (mo  < 12)         return `${mo}mo ago`;
+  return `${Math.floor(mo / 12)}y ago`;
+}
+
 function findRepoRootInTar(extractDir) {
   // GitHub tarballs unpack as `<repo>-<branch>/...`
   const entries = fs.readdirSync(extractDir, { withFileTypes: true });
@@ -253,6 +294,28 @@ module.exports = [
       } catch (e) {
         reply(`❌ Redeploy failed: ${e?.response?.data?.errors?.[0]?.message || e.message}`);
       }
+    },
+  },
+  {
+    name: 'changelog', aliases: ['commits', 'whatsnew'], owner,
+    description: 'Show the last 5 GitHub commits (preview what .update will pull)',
+    handler: async ({ reply, argText }) => {
+      // Allow .changelog 10 to ask for a different count (1-20).
+      const n = Math.max(1, Math.min(20, parseInt(argText, 10) || 5));
+      const commits = await recentCommits(n);
+      if (!commits) return reply('❌ Could not reach GitHub. Try again in a moment.');
+      if (!commits.length) return reply('No commits found on this branch.');
+
+      const lines = [
+        `📜 *Last ${commits.length} commits on \`${REPO_BRANCH}\`*`,
+        `_Run .update to apply the top one._`,
+        '',
+      ];
+      for (const c of commits) {
+        lines.push(`• \`${c.sha}\` — ${c.message}`);
+        lines.push(`   _${c.author} · ${relativeTime(c.date)}_`);
+      }
+      reply(lines.join('\n'));
     },
   },
   {
