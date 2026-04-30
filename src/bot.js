@@ -22,6 +22,39 @@ let lastPairCode = null;
 let pendingPairNumber = null;
 let avatarApplied = false;
 
+// In-memory cache of recent messages so antidelete can recover them.
+// Map<chatJid, Map<msgId, { message, sender, timestamp, pushName }>>
+const messageCache = new Map();
+const MAX_PER_CHAT = 200;
+
+function rememberMessage(m) {
+  try {
+    if (!m?.key?.id || !m?.key?.remoteJid || !m.message) return;
+    if (m.message.protocolMessage) return; // ignore protocol messages
+    const chat = m.key.remoteJid;
+    let chatMap = messageCache.get(chat);
+    if (!chatMap) { chatMap = new Map(); messageCache.set(chat, chatMap); }
+    if (chatMap.size >= MAX_PER_CHAT) {
+      const firstKey = chatMap.keys().next().value;
+      chatMap.delete(firstKey);
+    }
+    chatMap.set(m.key.id, {
+      message: m.message,
+      sender: m.key.participant || m.key.remoteJid,
+      timestamp: m.messageTimestamp,
+      pushName: m.pushName || '',
+    });
+  } catch (_) {}
+}
+
+function recallMessage(chatJid, msgId) {
+  const chatMap = messageCache.get(chatJid);
+  if (!chatMap) return null;
+  const cached = chatMap.get(msgId);
+  if (cached) chatMap.delete(msgId);
+  return cached;
+}
+
 function hasSession() {
   try {
     return fs.existsSync(path.join(config.paths.auth, 'creds.json'));
@@ -118,7 +151,52 @@ async function start() {
     }
   });
 
-  sock.ev.on('messages.upsert', (ev) => handler.onMessages(sock, ev));
+  sock.ev.on('messages.upsert', (ev) => {
+    try {
+      for (const m of ev.messages || []) rememberMessage(m);
+    } catch (_) {}
+    handler.onMessages(sock, ev);
+  });
+
+  // Anti-delete: capture "delete for everyone" events and forward the original to the owner.
+  sock.ev.on('messages.update', async (updates) => {
+    if (!store.get().antidelete) return;
+    for (const u of updates) {
+      try {
+        const proto = u.update?.message?.protocolMessage;
+        const isRevoke =
+          (proto && (proto.type === 0 || proto.type === 'REVOKE')) ||
+          u.update?.messageStubType === 68 || // REVOKE
+          u.update?.status === 'DELETED';
+        if (!isRevoke) continue;
+
+        const chat = u.key?.remoteJid;
+        const msgId = proto?.key?.id || u.key?.id;
+        if (!chat || !msgId) continue;
+
+        const cached = recallMessage(chat, msgId);
+        if (!cached) continue;
+
+        const ownerJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+        const senderName = cached.pushName || cached.sender?.split('@')[0] || 'unknown';
+        const when = new Date((Number(cached.timestamp) || Date.now() / 1000) * 1000).toLocaleString();
+        const header = `🛡️ *ANTI-DELETE*\n\n*From:* @${(cached.sender || '').split('@')[0]} (${senderName})\n*Chat:* ${chat}\n*Sent:* ${when}\n\n_Original message:_`;
+
+        await sock.sendMessage(ownerJid, { text: header, mentions: [cached.sender] }).catch(() => {});
+        // Forward the original message content
+        await sock.relayMessage(ownerJid, cached.message, {}).catch(async () => {
+          // Fallback: if relay fails, try to extract text/caption
+          const txt =
+            cached.message.conversation ||
+            cached.message.extendedTextMessage?.text ||
+            cached.message.imageMessage?.caption ||
+            cached.message.videoMessage?.caption ||
+            '[non-text content could not be re-sent]';
+          await sock.sendMessage(ownerJid, { text: `\`\`\`${txt}\`\`\`` }).catch(() => {});
+        });
+      } catch (_) {}
+    }
+  });
 
   return sock;
 }

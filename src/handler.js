@@ -100,9 +100,14 @@ async function handleAutoFeatures(ctx) {
     setTimeout(() => sock.sendPresenceUpdate('paused', jid).catch(() => {}), 1500);
   }
 
-  // .aion / .aionall auto-reply: only DMs, not groups, not from me
+  // .aion / .aionall auto-reply: DMs only.
+  // Normally we skip ctx.fromMe to avoid loops, BUT in the user's own self-chat
+  // (Message yourself) every message is fromMe — so we still allow it there.
   const aiActive = s.aiOn[jid] === true || (s.aiOnAll && s.aiOn[jid] !== false);
-  if (!isGroup && !ctx.fromMe && aiActive && ctx.text && !parsePrefix(ctx.text)) {
+  const myJid = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : null;
+  const isSelfChat = myJid && jid === myJid;
+  const allowFromMe = isSelfChat; // personal AI assistant mode
+  if (!isGroup && (!ctx.fromMe || allowFromMe) && aiActive && ctx.text && !parsePrefix(ctx.text)) {
     try {
       const out = await ai.autoReply(jid, ctx.text);
       await reply(ctx.sock, m, out);
