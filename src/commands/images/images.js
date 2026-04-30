@@ -23,7 +23,16 @@ function imgCmd(name, query) {
           // keyword has no match. Require a realistic image size (>= 20KB)
           // to count as a hit; otherwise fall through to the next source.
           if (buf && buf.length >= 20 * 1024) {
-            await sock.sendMessage(jid, { image: buf, caption: `#${name}` }, { quoted: m });
+            // IMPORTANT: do NOT use '#' or any other prefix character here.
+            // '#' is a configured command prefix, so a caption like "#tech"
+            // gets re-parsed as the .tech command when WhatsApp echoes the
+            // outbound message back through messages.upsert — that's how the
+            // chat-flood loop happened. Plain text captions are safe.
+            await sock.sendMessage(
+              jid,
+              { image: buf, caption: `Random ${name} image` },
+              { quoted: m }
+            );
             return;
           }
         } catch (_) {}
