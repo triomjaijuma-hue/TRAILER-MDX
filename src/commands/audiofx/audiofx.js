@@ -7,6 +7,7 @@ const { execFile } = require('child_process');
 const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 const helpers = require('../../lib/helpers');
 const config = require('../../lib/config');
+const logger = require('../../lib/logger');
 
 function ffmpeg(args) {
   return new Promise((resolve, reject) => {
@@ -17,10 +18,43 @@ function ffmpeg(args) {
   });
 }
 
-async function getQuotedAudio(m) {
-  const inner = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-  if (!inner?.audioMessage && !inner?.videoMessage) return null;
-  return downloadMediaMessage({ message: inner }, 'buffer', {});
+// Build a "fake" full message object from the quoted message so Baileys'
+// downloadMediaMessage has the .key (id, remoteJid, participant) it needs
+// to decrypt. The previous `{ message: inner }` shape was missing the key
+// entirely, which silently failed for many media types in current Baileys.
+function buildQuotedMessageObject(m) {
+  const ctxInfo = m.message?.extendedTextMessage?.contextInfo;
+  const inner = ctxInfo?.quotedMessage;
+  if (!inner) return null;
+  if (!inner.audioMessage && !inner.videoMessage) return null;
+  return {
+    key: {
+      remoteJid: m.key.remoteJid,
+      id: ctxInfo.stanzaId,
+      participant: ctxInfo.participant || ctxInfo.remoteJid || m.key.remoteJid,
+      fromMe: ctxInfo.participant === undefined ? false : false,
+    },
+    message: inner,
+  };
+}
+
+async function getQuotedAudio(sock, m) {
+  const quoted = buildQuotedMessageObject(m);
+  if (!quoted) return null;
+  try {
+    return await downloadMediaMessage(
+      quoted,
+      'buffer',
+      {},
+      {
+        logger,
+        reuploadRequest: sock.updateMediaMessage,
+      },
+    );
+  } catch (e) {
+    logger.warn({ err: e?.message }, 'audiofx: quoted media download failed');
+    return null;
+  }
 }
 
 function fxCmd(name, filterArgs, description) {
@@ -28,19 +62,20 @@ function fxCmd(name, filterArgs, description) {
     name,
     description,
     handler: async ({ sock, jid, m, reply }) => {
-      const buf = await getQuotedAudio(m).catch(() => null);
-      if (!buf) return reply('Reply to an audio/voice note with this command.');
+      const buf = await getQuotedAudio(sock, m);
+      if (!buf) return reply('Reply to an audio or voice note with this command.');
       helpers.ensureTmp();
       const id = Date.now().toString(36);
       const inFile = path.join(config.paths.tmp, `fx_${id}_in.mp3`);
       const outFile = path.join(config.paths.tmp, `fx_${id}_out.mp3`);
       fs.writeFileSync(inFile, buf);
       try {
-        await ffmpeg(['-y', '-i', inFile, ...filterArgs, outFile]);
+        await ffmpeg(['-y', '-i', inFile, ...filterArgs, '-ac', '2', '-ar', '44100', '-b:a', '128k', outFile]);
         const out = fs.readFileSync(outFile);
         await sock.sendMessage(jid, { audio: out, mimetype: 'audio/mpeg', ptt: true }, { quoted: m });
-      } catch (e) { reply(`FX failed: ${e?.message}\n(Make sure ffmpeg is installed in the deploy environment.)`); }
-      finally {
+      } catch (e) {
+        reply(`FX failed: ${e?.message}\n(Make sure ffmpeg is installed in the deploy environment.)`);
+      } finally {
         try { fs.unlinkSync(inFile); } catch (_) {}
         try { fs.unlinkSync(outFile); } catch (_) {}
       }
