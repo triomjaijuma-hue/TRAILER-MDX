@@ -14,6 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# yt-dlp — required for .play / .video / .ytmp3 / .ytmp4 since the public
+# wrapper APIs (cobalt, giftedtech, davidcyril, ...) are mostly dead in 2026.
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+      -o /usr/local/bin/yt-dlp \
+    && chmod +x /usr/local/bin/yt-dlp
+
 WORKDIR /app
 
 # Install deps first for layer caching
