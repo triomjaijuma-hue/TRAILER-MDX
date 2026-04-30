@@ -1,11 +1,169 @@
 'use strict';
-// .update — owner-only command that pulls the latest commit and restarts the bot.
-// Best path: trigger a Railway redeploy via Railway's GraphQL API (only true update on Railway).
-// Fallback: exit the process so a container restart policy picks the latest image.
+// .update — owner-only hot-pull from GitHub.
+//
+// Default behaviour ("hot pull"):
+//   1. Download the latest tarball of the default branch from GitHub.
+//   2. Extract over the current project, preserving runtime state
+//      (auth_info/, node_modules/, .env, tmp/, *.log).
+//   3. If package.json changed, run `npm install --omit=dev`.
+//   4. process.exit(0). Railway's restart policy (ALWAYS) re-launches
+//      the process inside the SAME container, so the WhatsApp session
+//      in auth_info/ survives — NO new pairing code needed.
+//
+// .redeploy — owner-only true Railway redeploy via GraphQL API.
+//   Useful only if the hot-pull path is broken. Spins up a fresh
+//   container and will lose auth_info/ unless it sits on a Railway
+//   persistent volume mounted at /app/auth_info.
+//
+// .restart — owner-only clean restart (no code update).
 
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { spawnSync } = require('child_process');
 
 const owner = true;
+
+const REPO_USER   = process.env.UPDATE_REPO_USER   || 'triomjaijuma-hue';
+const REPO_NAME   = process.env.UPDATE_REPO_NAME   || 'TRAILER-MDX';
+const REPO_BRANCH = process.env.UPDATE_REPO_BRANCH || 'main';
+
+// Project root = three levels up from this file (src/commands/owner/update.js)
+const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
+
+// Anything in this set is left untouched during the overlay.
+// IMPORTANT: auth_info MUST stay here so the WhatsApp session is preserved.
+const PRESERVE = new Set([
+  'auth_info',
+  'node_modules',
+  '.env',
+  '.env.local',
+  '.env.production',
+  'tmp',
+  '.git',
+  'logs',
+]);
+
+async function latestCommit() {
+  try {
+    const r = await axios.get(
+      `https://api.github.com/repos/${REPO_USER}/${REPO_NAME}/commits/${REPO_BRANCH}`,
+      { timeout: 10000, headers: { 'User-Agent': 'TRAILER-MDX' } }
+    );
+    return {
+      sha: r.data.sha?.slice(0, 7),
+      message: (r.data.commit?.message || '').split('\n')[0],
+      author: r.data.commit?.author?.name,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function findRepoRootInTar(extractDir) {
+  // GitHub tarballs unpack as `<repo>-<branch>/...`
+  const entries = fs.readdirSync(extractDir, { withFileTypes: true });
+  const dir = entries.find((e) => e.isDirectory());
+  return dir ? path.join(extractDir, dir.name) : null;
+}
+
+function copyTree(src, dst) {
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const sp = path.join(src, entry.name);
+    const dp = path.join(dst, entry.name);
+    if (entry.isDirectory()) {
+      fs.mkdirSync(dp, { recursive: true });
+      copyTree(sp, dp);
+    } else if (entry.isSymbolicLink()) {
+      const target = fs.readlinkSync(sp);
+      try { fs.unlinkSync(dp); } catch (_) {}
+      try { fs.symlinkSync(target, dp); } catch (_) {}
+    } else {
+      fs.copyFileSync(sp, dp);
+    }
+  }
+}
+
+function syncFiles(srcRoot, dstRoot) {
+  let pkgChanged = false;
+  let touched = 0;
+  for (const entry of fs.readdirSync(srcRoot, { withFileTypes: true })) {
+    if (PRESERVE.has(entry.name)) continue;
+    const sp = path.join(srcRoot, entry.name);
+    const dp = path.join(dstRoot, entry.name);
+
+    if (entry.name === 'package.json' || entry.name === 'package-lock.json') {
+      const oldContent = fs.existsSync(dp) ? fs.readFileSync(dp, 'utf8') : '';
+      const newContent = fs.readFileSync(sp, 'utf8');
+      if (oldContent !== newContent) pkgChanged = true;
+    }
+
+    if (entry.isDirectory()) {
+      // Mirror dirs so deleted files actually go away.
+      try { fs.rmSync(dp, { recursive: true, force: true }); } catch (_) {}
+      fs.mkdirSync(dp, { recursive: true });
+      copyTree(sp, dp);
+    } else {
+      fs.copyFileSync(sp, dp);
+    }
+    touched++;
+  }
+  return { pkgChanged, touched };
+}
+
+async function hotPull(notify) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'trailer-update-'));
+  try {
+    const tarUrl = `https://codeload.github.com/${REPO_USER}/${REPO_NAME}/tar.gz/refs/heads/${REPO_BRANCH}`;
+    await notify(`📥 Downloading latest \`${REPO_BRANCH}\` from GitHub...`);
+    const r = await axios.get(tarUrl, {
+      responseType: 'arraybuffer',
+      timeout: 60000,
+      maxContentLength: 200 * 1024 * 1024,
+      maxBodyLength: 200 * 1024 * 1024,
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+    const tarPath = path.join(tmpDir, 'src.tgz');
+    fs.writeFileSync(tarPath, Buffer.from(r.data));
+
+    const extractDir = path.join(tmpDir, 'unpacked');
+    fs.mkdirSync(extractDir);
+    const x = spawnSync('tar', ['-xzf', tarPath, '-C', extractDir], { stdio: 'pipe' });
+    if (x.status !== 0) {
+      return { ok: false, message: `tar extract failed: ${(x.stderr || '').toString().slice(0, 200)}` };
+    }
+
+    const repoSrc = findRepoRootInTar(extractDir);
+    if (!repoSrc) return { ok: false, message: 'tarball was empty' };
+
+    await notify(`📂 Applying files into the running container...`);
+    const { pkgChanged, touched } = syncFiles(repoSrc, PROJECT_ROOT);
+
+    let depSummary = '';
+    if (pkgChanged) {
+      await notify(`📦 \`package.json\` changed — installing deps (this can take ~30s)...`);
+      const npmStart = Date.now();
+      const npm = spawnSync('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'], {
+        cwd: PROJECT_ROOT,
+        stdio: 'pipe',
+        timeout: 180000,
+        env: { ...process.env, npm_config_loglevel: 'error' },
+      });
+      const took = Math.round((Date.now() - npmStart) / 1000);
+      if (npm.status !== 0) {
+        return {
+          ok: false,
+          message: `npm install failed after ${took}s.\n\n\`\`\`${(npm.stderr || npm.stdout || '').toString().slice(-500)}\`\`\``,
+        };
+      }
+      depSummary = ` (deps refreshed in ${took}s)`;
+    }
+    return { ok: true, pkgChanged, touched, depSummary };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  }
+}
 
 async function railwayRedeploy() {
   const token = process.env.RAILWAY_API_TOKEN || process.env.RAILWAY_TOKEN;
@@ -16,14 +174,12 @@ async function railwayRedeploy() {
       ok: false,
       reason: 'missing-token',
       message:
-        '⚠️ Railway API token not set.\n\n' +
-        'To enable one-tap updates from WhatsApp:\n' +
-        '1. Open https://railway.com/account/tokens\n' +
-        '2. Click *Create Token* → copy it\n' +
-        '3. In your Railway project → *Variables* → add:\n' +
-        '   `RAILWAY_API_TOKEN=<the token>`\n' +
-        '4. Railway auto-injects `RAILWAY_SERVICE_ID` and `RAILWAY_ENVIRONMENT_ID`.\n\n' +
-        'After that, `.update` will redeploy the bot to the latest commit on its own.',
+        '⚠️ Railway API not configured.\n\n' +
+        'To enable `.redeploy` (full container rebuild):\n' +
+        '1. Open https://railway.com/account/tokens → *Create Token*\n' +
+        '2. In your Railway project → *Variables* → add `RAILWAY_API_TOKEN`\n' +
+        '   (Railway auto-injects `RAILWAY_SERVICE_ID` and `RAILWAY_ENVIRONMENT_ID`.)\n\n' +
+        '_Tip: prefer `.update` instead — it preserves your WhatsApp session._',
     };
   }
   const r = await axios.post(
@@ -36,10 +192,7 @@ async function railwayRedeploy() {
     },
     {
       timeout: 20000,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     }
   );
   if (r.data?.errors?.length) {
@@ -48,46 +201,57 @@ async function railwayRedeploy() {
   return { ok: true };
 }
 
-async function latestCommit() {
-  try {
-    const r = await axios.get(
-      'https://api.github.com/repos/triomjaijuma-hue/TRAILER-MDX/commits/main',
-      { timeout: 10000, headers: { 'User-Agent': 'TRAILER-MDX' } }
-    );
-    return {
-      sha: r.data.sha?.slice(0, 7),
-      message: r.data.commit?.message?.split('\n')[0],
-      author: r.data.commit?.author?.name,
-    };
-  } catch (_) {
-    return null;
-  }
-}
-
 module.exports = [
   {
-    name: 'update', aliases: ['upgrade', 'pull'], owner,
-    description: 'Pull the latest version of the bot from GitHub and restart',
+    name: 'update', aliases: ['upgrade', 'pull', 'hotpull'], owner,
+    description: 'Hot-pull latest code from GitHub and restart (preserves session)',
     handler: async ({ reply }) => {
       const latest = await latestCommit();
       const header = latest
-        ? `🔄 *Updating to latest commit*\n\n*${latest.sha}* — ${latest.message}\n_by ${latest.author}_\n\n`
-        : `🔄 *Updating bot...*\n\n`;
-
+        ? `🔄 *Hot-updating to ${latest.sha}*\n_${latest.message}_\n_by ${latest.author}_\n\n`
+        : `🔄 *Hot-updating from GitHub*\n\n`;
+      try {
+        await reply(header + '⏳ Pulling latest code into the running container — your session stays intact.');
+        const r = await hotPull(reply);
+        if (!r.ok) {
+          return reply(`❌ Hot-update failed: ${r.message}\n\n_Try \`.redeploy\` for a full Railway rebuild instead._`);
+        }
+        await reply(`✅ Updated ${r.touched} top-level paths${r.depSummary}.\n♻️ Restarting in 2s — pairing is preserved.`);
+        // Give the message time to flush, then exit.
+        // Railway's restart policy (ALWAYS) brings the process back up
+        // inside the same container, so auth_info/ is still there.
+        setTimeout(() => process.exit(0), 2000);
+      } catch (e) {
+        reply(`❌ Hot-update error: ${e?.message || e}`);
+      }
+    },
+  },
+  {
+    name: 'restart', aliases: ['reboot'], owner,
+    description: 'Restart the bot process (no code change)',
+    handler: async ({ reply }) => {
+      await reply('🔁 Restarting in 2s...');
+      setTimeout(() => process.exit(0), 2000);
+    },
+  },
+  {
+    name: 'redeploy', owner,
+    description: 'Full Railway rebuild (will reset session unless on a volume)',
+    handler: async ({ reply }) => {
+      const latest = await latestCommit();
+      const header = latest
+        ? `🔁 *Redeploying to ${latest.sha}*\n_${latest.message}_\n\n`
+        : '🔁 *Redeploying...*\n\n';
       try {
         const result = await railwayRedeploy();
         if (result.ok) {
-          await reply(header + '✅ Redeploy triggered on Railway. Bot will be back online in ~30s with the new code.');
-          // Give the message time to flush, then exit so the new build takes over cleanly.
+          await reply(header + '✅ Redeploy triggered. Bot will be back online in ~30s with a fresh container.');
           setTimeout(() => process.exit(0), 3000);
           return;
         }
-        if (result.reason === 'missing-token') {
-          return reply(header + result.message);
-        }
-        return reply(header + `❌ Update failed: ${result.message}\n\nFalling back to manual: open Railway → Deployments → Redeploy.`);
+        return reply(header + result.message);
       } catch (e) {
-        return reply(`❌ Update failed: ${e?.response?.data?.errors?.[0]?.message || e.message}`);
+        reply(`❌ Redeploy failed: ${e?.response?.data?.errors?.[0]?.message || e.message}`);
       }
     },
   },
@@ -97,9 +261,12 @@ module.exports = [
     handler: async ({ reply }) => {
       const config = require('../../lib/config');
       const latest = await latestCommit();
-      let txt = `🤖 *${config.botName}* v${config.version}\nNode ${process.version} • Uptime ${Math.round(process.uptime() / 60)}m`;
-      if (latest) txt += `\n\n*Latest on GitHub:* ${latest.sha} — ${latest.message}`;
-      reply(txt);
+      const lines = [
+        `🤖 *${config.botName}* v${config.version}`,
+        `Node ${process.version} • Uptime ${Math.round(process.uptime() / 60)}m`,
+      ];
+      if (latest) lines.push('', `*Latest on GitHub:* ${latest.sha} — ${latest.message}`);
+      reply(lines.join('\n'));
     },
   },
 ];
