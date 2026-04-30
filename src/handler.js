@@ -6,6 +6,7 @@ const logger = require('./lib/logger');
 const helpers = require('./lib/helpers');
 const store = require('./lib/store');
 const ai = require('./lib/ai');
+const gameSessions = require('./lib/gameSessions');
 
 // Lazy-load all plugin command files
 const commands = new Map(); // name -> { handler, category, description }
@@ -258,8 +259,18 @@ async function onMessages(sock, ev) {
 
     try { await handleAutoFeatures(ctx); } catch (_) {}
 
+    // --- Game session check -----------------------------------------
+    // Must run BEFORE the prefix check so that replies to trivia/math/
+    // hangman/tictactoe (which have no prefix) are caught and processed.
     const parsed = parsePrefix(ctx.text);
-    if (!parsed) continue;
+    if (!parsed) {
+      // Check active game sessions for this sender
+      const gameReply = gameSessions.checkAnswer(ctx.sender || ctx.jid, ctx.text);
+      if (gameReply) {
+        try { await ctx.reply(gameReply); } catch (_) {}
+      }
+      continue;
+    }
 
     const [cmdRaw, ...rest] = parsed.rest.trim().split(/\s+/);
     if (!cmdRaw) continue;
