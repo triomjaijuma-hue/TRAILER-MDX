@@ -151,51 +151,62 @@ async function start() {
     }
   });
 
-  sock.ev.on('messages.upsert', (ev) => {
-    try {
-      for (const m of ev.messages || []) rememberMessage(m);
-    } catch (_) {}
-    handler.onMessages(sock, ev);
-  });
-
-  // Anti-delete: capture "delete for everyone" events and forward the original to the owner.
-  sock.ev.on('messages.update', async (updates) => {
+  // Anti-delete: WhatsApp's "delete for everyone" is delivered as a
+  // protocolMessage of type REVOKE (0) inside messages.upsert — NOT
+  // through messages.update. So we detect it here, where it actually fires.
+  async function handleRevoke(revokeMsg, proto) {
     if (!store.get().antidelete) return;
-    for (const u of updates) {
-      try {
-        const proto = u.update?.message?.protocolMessage;
-        const isRevoke =
-          (proto && (proto.type === 0 || proto.type === 'REVOKE')) ||
-          u.update?.messageStubType === 68 || // REVOKE
-          u.update?.status === 'DELETED';
-        if (!isRevoke) continue;
+    const chat = proto.key?.remoteJid || revokeMsg.key?.remoteJid;
+    const msgId = proto.key?.id;
+    if (!chat || !msgId) return;
 
-        const chat = u.key?.remoteJid;
-        const msgId = proto?.key?.id || u.key?.id;
-        if (!chat || !msgId) continue;
+    const cached = recallMessage(chat, msgId);
+    if (!cached) return; // we never saw the original (e.g. bot was offline)
 
-        const cached = recallMessage(chat, msgId);
-        if (!cached) continue;
+    const ownerJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
+    if (!ownerJid) return;
 
-        const ownerJid = sock.user?.id?.split(':')[0] + '@s.whatsapp.net';
-        const senderName = cached.pushName || cached.sender?.split('@')[0] || 'unknown';
-        const when = new Date((Number(cached.timestamp) || Date.now() / 1000) * 1000).toLocaleString();
-        const header = `🛡️ *ANTI-DELETE*\n\n*From:* @${(cached.sender || '').split('@')[0]} (${senderName})\n*Chat:* ${chat}\n*Sent:* ${when}\n\n_Original message:_`;
+    // Don't re-forward messages the bot itself sent or that the owner deleted.
+    const deleterJid = revokeMsg.key?.participant || revokeMsg.key?.remoteJid;
+    if (deleterJid && deleterJid.split('@')[0] === ownerJid.split('@')[0]) return;
 
-        await sock.sendMessage(ownerJid, { text: header, mentions: [cached.sender] }).catch(() => {});
-        // Forward the original message content
-        await sock.relayMessage(ownerJid, cached.message, {}).catch(async () => {
-          // Fallback: if relay fails, try to extract text/caption
-          const txt =
-            cached.message.conversation ||
-            cached.message.extendedTextMessage?.text ||
-            cached.message.imageMessage?.caption ||
-            cached.message.videoMessage?.caption ||
-            '[non-text content could not be re-sent]';
-          await sock.sendMessage(ownerJid, { text: `\`\`\`${txt}\`\`\`` }).catch(() => {});
-        });
-      } catch (_) {}
+    const senderName = cached.pushName || cached.sender?.split('@')[0] || 'unknown';
+    const when = new Date((Number(cached.timestamp) || Date.now() / 1000) * 1000).toLocaleString();
+    const senderShort = (cached.sender || '').split('@')[0];
+    const deleterShort = (deleterJid || '').split('@')[0];
+    const header =
+      `🛡️ *ANTI-DELETE*\n\n` +
+      `*Sender:* @${senderShort} (${senderName})\n` +
+      (deleterShort && deleterShort !== senderShort ? `*Deleted by:* @${deleterShort}\n` : '') +
+      `*Chat:* ${chat}\n*Sent:* ${when}\n\n_Original message:_`;
+    const mentions = [cached.sender, deleterJid].filter(Boolean);
+
+    await sock.sendMessage(ownerJid, { text: header, mentions }).catch(() => {});
+    // Re-deliver the original message content to the owner
+    await sock.relayMessage(ownerJid, cached.message, {}).catch(async () => {
+      const txt =
+        cached.message.conversation ||
+        cached.message.extendedTextMessage?.text ||
+        cached.message.imageMessage?.caption ||
+        cached.message.videoMessage?.caption ||
+        '[non-text content could not be re-sent]';
+      await sock.sendMessage(ownerJid, { text: '```' + txt + '```' }).catch(() => {});
+    });
+  }
+
+  sock.ev.on('messages.upsert', async (ev) => {
+    try {
+      for (const m of ev.messages || []) {
+        rememberMessage(m);
+        const proto = m.message?.protocolMessage;
+        if (proto && (proto.type === 0 || proto.type === 'REVOKE')) {
+          await handleRevoke(m, proto);
+        }
+      }
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'messages.upsert pre-handler failed');
     }
+    handler.onMessages(sock, ev);
   });
 
   return sock;

@@ -7,9 +7,42 @@ const ytdlOriginal = require('ytdl-core');
 const axios = require('axios');
 const helpers = require('../../lib/helpers');
 
+// Pick the result that best matches the query, instead of blindly
+// taking the first hit (which is often a remix / cover / reaction).
 async function search(q) {
   const r = await yts(q);
-  return r.videos?.[0] || null;
+  const vids = r.videos || [];
+  if (!vids.length) return null;
+
+  const tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const scoreOf = (v) => {
+    const title = (v.title || '').toLowerCase();
+    const author = (v.author?.name || '').toLowerCase();
+    let score = 0;
+    for (const t of tokens) {
+      if (title.includes(t)) score += 3;
+      if (author.includes(t)) score += 2;
+    }
+    // Prefer official uploads and the artist's auto-generated "Topic" channel
+    if (/official\s+(audio|video|music)/i.test(v.title)) score += 3;
+    if (/lyrics?/i.test(v.title)) score += 1;
+    if (/\btopic\b|vevo/i.test(v.author?.name || '')) score += 3;
+    // Penalize obviously-not-the-song results
+    if (/reaction|tutorial|cover|how to play|guitar lesson|piano lesson|sped\s*up|nightcore|slowed/i.test(v.title)) score -= 3;
+    if (/mix|playlist|hours?/i.test(v.title)) score -= 1;
+    // Prefer realistic song durations (45s – 12 min)
+    const sec = v.duration?.seconds || 0;
+    if (sec >= 45 && sec <= 720) score += 1;
+    else if (sec > 720) score -= 2;
+    // Slight tie-break: prefer more views
+    score += Math.min(3, Math.log10((v.views || 1) + 1) / 2);
+    return score;
+  };
+
+  const ranked = vids.slice(0, 15)
+    .map(v => ({ v, s: scoreOf(v) }))
+    .sort((a, b) => b.s - a.s);
+  return ranked[0]?.v || vids[0];
 }
 
 // Try multiple strategies to get an audio buffer for a YouTube URL.
