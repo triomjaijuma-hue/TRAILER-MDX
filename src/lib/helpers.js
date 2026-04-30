@@ -26,6 +26,15 @@ async function getJson(url, opts = {}) {
   return res.data;
 }
 
+async function getText(url, opts = {}) {
+  const res = await axios.get(url, {
+    timeout: opts.timeout || 20000,
+    responseType: 'text',
+    headers: { 'User-Agent': 'Mozilla/5.0 TRAILER-MDX', ...(opts.headers || {}) },
+  });
+  return typeof res.data === 'string' ? res.data : String(res.data);
+}
+
 async function postJson(url, body, opts = {}) {
   const res = await axios.post(url, body, {
     timeout: opts.timeout || 30000,
@@ -65,6 +74,7 @@ module.exports = {
   ensureTmp,
   downloadToBuffer,
   getJson,
+  getText,
   postJson,
   formatUptime,
   formatBytes,

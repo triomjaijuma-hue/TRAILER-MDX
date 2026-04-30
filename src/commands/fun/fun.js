@@ -2,7 +2,10 @@
 const helpers = require('../../lib/helpers');
 
 module.exports = [
-  { name: '8ball', description: 'Magic 8-ball', handler: async ({ reply }) => reply(helpers.pickRandom(['Yes','No','Maybe','Definitely','Ask again later','Without a doubt','Very doubtful'])) },
+  { name: '8ball', aliases: ['8balls', 'eightball', 'magic8'], description: 'Magic 8-ball', handler: async ({ argText, reply }) => {
+    const answers = ['It is certain.','Without a doubt.','Yes, definitely.','You may rely on it.','As I see it, yes.','Most likely.','Outlook good.','Yes.','Signs point to yes.','Reply hazy, try again.','Ask again later.','Better not tell you now.','Cannot predict now.','Concentrate and ask again.','Don\'t count on it.','My reply is no.','My sources say no.','Outlook not so good.','Very doubtful.'];
+    reply(`🎱 ${argText ? `*Q:* ${argText}\n` : ''}*A:* ${helpers.pickRandom(answers)}`);
+  } },
   { name: 'fact', description: 'Random fact', handler: async ({ reply }) => {
     try { const d = await helpers.getJson('https://uselessfacts.jsph.pl/random.json?language=en'); reply(d.text); }
     catch { reply('Honey never spoils.'); }

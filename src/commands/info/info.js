@@ -46,7 +46,19 @@ module.exports = [
     const bot = require('../../bot');
     reply(`Connected: ${bot.isConnected()}\nSession: ${bot.hasSession() ? 'yes' : 'no'}\nUse the web pairing page if needed.`);
   } },
-  { name: 'trends', description: 'Google trends URL', handler: async ({ argText, reply }) => reply(`https://trends.google.com/trends/explore?q=${encodeURIComponent(argText)}`) },
+  { name: 'trends', description: 'Google Trends — top searches', handler: async ({ argText, reply }) => {
+    if (!argText || !argText.trim()) {
+      // Show top daily trends from Google Trends RSS
+      try {
+        const helpersLib = require('../../lib/helpers');
+        const xml = await helpersLib.getText('https://trends.google.com/trends/trendingsearches/daily/rss?geo=US');
+        const titles = [...xml.matchAll(/<title>([^<]+)<\/title>/g)].slice(1, 11).map(m => m[1]);
+        if (titles.length) return reply(`📈 *Top Trending Now (US)*\n\n${titles.map((t, i) => `${i + 1}. ${t}`).join('\n')}\n\n_Tip: \`.trends <topic>\` for a specific search._`);
+      } catch (_) {}
+      return reply('📈 Trends: https://trends.google.com/trends/trendingsearches/daily\n\n_Usage: \`.trends <topic>\`_');
+    }
+    reply(`📈 https://trends.google.com/trends/explore?q=${encodeURIComponent(argText.trim())}`);
+  } },
   { name: 'weather', description: 'Weather (Open-Meteo)', handler: async ({ argText, reply }) => {
     if (!argText) return reply('Usage: .weather <city>');
     try {

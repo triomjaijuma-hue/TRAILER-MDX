@@ -9,14 +9,35 @@ module.exports = [
       reply(`*${d.title}*\n\n${d.extract || '(no summary)'}\n\n${d.content_urls?.desktop?.page || ''}`);
     } catch (e) { reply(`Failed: ${e?.message}`); }
   } },
-  { name: 'define', description: 'Word definition', handler: async ({ argText, reply }) => {
+  { name: 'define', aliases: ['dict', 'meaning'], description: 'Word definition', handler: async ({ argText, reply }) => {
     if (!argText) return reply('Usage: .define <word>');
+    const word = argText.trim().split(/\s+/)[0].toLowerCase();
+    // Strategy 1: dictionaryapi.dev
     try {
-      const d = await helpers.getJson(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(argText)}`);
+      const d = await helpers.getJson(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
       const e = d?.[0];
-      const def = e?.meanings?.[0]?.definitions?.[0]?.definition;
-      reply(`*${e?.word || argText}* — ${e?.phonetic || ''}\n${def || '(no definition)'}`);
-    } catch (e) { reply(`Failed: ${e?.message}`); }
+      if (e?.meanings?.length) {
+        const lines = [`📖 *${e.word}*${e.phonetic ? `  _${e.phonetic}_` : ''}`];
+        e.meanings.slice(0, 3).forEach(m => {
+          lines.push(`\n*(${m.partOfSpeech})*`);
+          m.definitions.slice(0, 2).forEach((def, i) => {
+            lines.push(`${i + 1}. ${def.definition}`);
+            if (def.example) lines.push(`   _e.g. "${def.example}"_`);
+          });
+        });
+        return reply(lines.join('\n'));
+      }
+    } catch (_) {}
+    // Strategy 2: Free Dictionary fallback via Wiktionary REST
+    try {
+      const wk = await helpers.getJson(`https://en.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(word)}`);
+      const en = wk?.en?.[0];
+      if (en?.definitions?.length) {
+        const txt = en.definitions.slice(0, 3).map((x, i) => `${i + 1}. ${x.definition.replace(/<[^>]+>/g, '')}`).join('\n');
+        return reply(`📖 *${word}* _(${en.partOfSpeech || 'word'})_\n${txt}`);
+      }
+    } catch (_) {}
+    reply(`📖 No definition found for *${word}*. Check spelling and try again.`);
   } },
   { name: 'element', description: 'Periodic table element', handler: async ({ argText, reply }) => {
     if (!argText) return reply('Usage: .element <symbol or name>');
