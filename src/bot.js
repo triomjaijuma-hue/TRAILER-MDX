@@ -34,10 +34,35 @@ const MAX_PER_CHAT = 200;
 const handledRevokes = new Set();
 const HANDLED_REVOKES_MAX = 1000;
 
+// WhatsApp wraps real message content inside several "envelope" types
+// (editedMessage, viewOnceMessage, ephemeralMessage, etc.). The protocol
+// message that signals a delete-for-everyone often arrives wrapped, so the
+// previous code was missing it entirely. This helper strips envelopes until
+// we reach the inner payload.
+function unwrapMessage(msg) {
+  if (!msg || typeof msg !== 'object') return msg;
+  const inner =
+    msg.ephemeralMessage?.message ||
+    msg.viewOnceMessage?.message ||
+    msg.viewOnceMessageV2?.message ||
+    msg.viewOnceMessageV2Extension?.message ||
+    msg.editedMessage?.message ||
+    msg.documentWithCaptionMessage?.message ||
+    msg.deviceSentMessage?.message ||
+    null;
+  return inner ? unwrapMessage(inner) : msg;
+}
+
+function extractProtocol(msg) {
+  const u = unwrapMessage(msg);
+  return u?.protocolMessage || null;
+}
+
 function rememberMessage(m) {
   try {
     if (!m?.key?.id || !m?.key?.remoteJid || !m.message) return;
-    if (m.message.protocolMessage) return; // ignore protocol messages
+    const inner = unwrapMessage(m.message);
+    if (!inner || inner.protocolMessage) return; // ignore protocol envelopes
     const chat = m.key.remoteJid;
     let chatMap = messageCache.get(chat);
     if (!chatMap) { chatMap = new Map(); messageCache.set(chat, chatMap); }
@@ -46,7 +71,7 @@ function rememberMessage(m) {
       chatMap.delete(firstKey);
     }
     chatMap.set(m.key.id, {
-      message: m.message,
+      message: inner,
       sender: m.key.participant || m.key.remoteJid,
       timestamp: m.messageTimestamp,
       pushName: m.pushName || '',
@@ -214,7 +239,11 @@ async function start() {
     }
 
     const cached = recallMessage(chat, msgId);
-    if (!cached) return; // we never saw the original (e.g. bot was offline)
+    if (!cached) {
+      logger.info({ chat, msgId }, 'antidelete: cache MISS (original not seen)');
+      return; // we never saw the original (e.g. bot was offline)
+    }
+    logger.info({ chat, msgId }, 'antidelete: cache HIT, restoring');
 
     const ownerJid = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : null;
     if (!ownerJid) return;
@@ -277,8 +306,13 @@ async function start() {
     try {
       for (const m of ev.messages || []) {
         rememberMessage(m);
-        const proto = m.message?.protocolMessage;
+        const proto = extractProtocol(m.message);
         if (proto && (proto.type === 0 || proto.type === 'REVOKE')) {
+          logger.info({
+            chat: m.key?.remoteJid,
+            origId: proto.key?.id,
+            via: 'upsert',
+          }, 'antidelete: revoke received');
           await handleRevoke(m, proto);
         }
         try { await enforceGroupRules(m); } catch (e) {
@@ -289,6 +323,39 @@ async function start() {
       logger.warn({ err: e?.message }, 'messages.upsert pre-handler failed');
     }
     handler.onMessages(sock, ev);
+  });
+
+  // Backup revoke path: some WhatsApp builds (especially when the deletion
+  // arrives a long time after the original) deliver the revoke as a
+  // messages.update with the message body wiped. Synthesize a revoke envelope
+  // from those updates so antidelete still fires.
+  sock.ev.on('messages.update', async (updates) => {
+    try {
+      for (const u of updates || []) {
+        if (!u?.key?.id || !u?.key?.remoteJid) continue;
+        const wasRevoked =
+          u.update?.message === null ||
+          u.update?.messageStubType === 1 || // REVOKE
+          (typeof u.update?.messageStubType === 'string' &&
+           /revoke/i.test(u.update.messageStubType));
+        if (!wasRevoked) continue;
+        logger.info({
+          chat: u.key.remoteJid,
+          origId: u.key.id,
+          via: 'update',
+        }, 'antidelete: revoke received');
+        const synthetic = {
+          key: { remoteJid: u.key.remoteJid, fromMe: false, id: 'synthetic_' + u.key.id },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        };
+        const synthProto = { type: 0, key: u.key };
+        await handleRevoke(synthetic, synthProto).catch((e) => {
+          logger.warn({ err: e?.message }, 'antidelete (update path) failed');
+        });
+      }
+    } catch (e) {
+      logger.warn({ err: e?.message }, 'messages.update handler failed');
+    }
   });
 
   // Welcome / goodbye on group-participants.update
