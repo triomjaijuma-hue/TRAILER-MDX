@@ -260,17 +260,17 @@ async function onMessages(sock, ev) {
     try { await handleAutoFeatures(ctx); } catch (_) {}
 
     // --- Game session check -----------------------------------------
-    // Must run BEFORE the prefix check so that replies to trivia/math/
-    // hangman/tictactoe (which have no prefix) are caught and processed.
-    const parsed = parsePrefix(ctx.text);
-    if (!parsed) {
-      // Check active game sessions for this sender
-      const gameReply = gameSessions.checkAnswer(ctx.sender || ctx.jid, ctx.text);
-      if (gameReply) {
-        try { await ctx.reply(gameReply); } catch (_) {}
-      }
+    // Runs for EVERY message (including prefixed ones like ".34" or ".paris")
+    // so users can reply naturally to trivia/math/hangman/tictactoe/quiz
+    // without worrying about dots or command prefixes.
+    const gameReply = gameSessions.checkAnswer(ctx.sender || ctx.jid, ctx.text);
+    if (gameReply) {
+      try { await ctx.reply(gameReply); } catch (_) {}
       continue;
     }
+
+    const parsed = parsePrefix(ctx.text);
+    if (!parsed) continue; // not a command and no active game session
 
     const [cmdRaw, ...rest] = parsed.rest.trim().split(/\s+/);
     if (!cmdRaw) continue;
