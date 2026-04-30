@@ -219,9 +219,14 @@ async function start() {
     const ownerJid = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : null;
     if (!ownerJid) return;
 
-    // Don't re-forward messages the bot itself sent or that the owner deleted.
+    // Avoid a visible loop: if the deletion happened in the OWNER'S OWN
+    // self-chat ("Message yourself"), don't re-send the deleted message
+    // back into that same chat. Antidelete still fires for the owner's
+    // own deletes in groups and other DMs — many users want a record of
+    // what they themselves deleted.
     const deleterJid = revokeMsg.key?.participant || revokeMsg.key?.remoteJid;
-    if (deleterJid && deleterJid.split('@')[0] === ownerJid.split('@')[0]) return;
+    const ownerNumber = ownerJid.split('@')[0];
+    if (chat && chat.split('@')[0] === ownerNumber && !chat.endsWith('@g.us')) return;
 
     const senderName = cached.pushName || cached.sender?.split('@')[0] || 'unknown';
     const when = new Date((Number(cached.timestamp) || Date.now() / 1000) * 1000).toLocaleString();
