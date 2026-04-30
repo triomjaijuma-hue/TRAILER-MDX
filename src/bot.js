@@ -17,6 +17,7 @@ const logger = require('./lib/logger');
 const helpers = require('./lib/helpers');
 const handler = require('./handler');
 const store = require('./lib/store');
+const sessionBackup = require('./lib/sessionBackup');
 
 let sock = null;
 let connected = false;
@@ -205,7 +206,13 @@ async function start() {
     }
   }
 
-  sock.ev.on('creds.update', saveCreds);
+  // Save creds locally AND schedule an encrypted push to GitHub. The push
+  // is debounced (~30s) and skipped when the encrypted blob is unchanged,
+  // so a quiet session doesn't generate noise commits.
+  sock.ev.on('creds.update', async (...args) => {
+    try { await saveCreds(...args); } catch (e) { logger.warn({ err: e?.message }, 'saveCreds failed'); }
+    try { sessionBackup.schedule(); } catch (_) {}
+  });
 
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect } = u;
