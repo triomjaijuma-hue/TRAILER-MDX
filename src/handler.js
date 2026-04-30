@@ -70,6 +70,36 @@ async function reply(sock, m, content) {
   return sock.sendMessage(jid, content, { quoted: m });
 }
 
+// --- Self-echo guard ----------------------------------------------------
+// WhatsApp echoes every outbound message back to us through messages.upsert
+// with key.fromMe = true. If a command's response happens to start with a
+// configured prefix (e.g. an image caption "#tech" while '#' is a prefix),
+// the bot will parse its own echo as a new command and loop forever, flooding
+// the chat. To prevent this we monkey-patch sock.sendMessage once, remember
+// every id we sent, and skip command processing for those ids when they
+// re-arrive.
+const ownSentIds = new Set();
+const OWN_SENT_MAX = 1000;
+function rememberOwnSent(key) {
+  if (!key?.id) return;
+  ownSentIds.add(key.id);
+  if (ownSentIds.size > OWN_SENT_MAX) {
+    const first = ownSentIds.values().next().value;
+    ownSentIds.delete(first);
+  }
+}
+const patchedSocks = new WeakSet();
+function patchSock(sock) {
+  if (!sock || patchedSocks.has(sock)) return;
+  patchedSocks.add(sock);
+  const orig = sock.sendMessage.bind(sock);
+  sock.sendMessage = async (...args) => {
+    const result = await orig(...args);
+    if (result?.key) rememberOwnSent(result.key);
+    return result;
+  };
+}
+
 // Per-category title shown in the top of the banner. The category comes
 // straight from the plugin folder name (admin/ -> ADMIN, etc.). If a new
 // category folder is added we just fall back to the raw name.
@@ -194,9 +224,13 @@ async function handleAutoFeatures(ctx) {
 }
 
 async function onMessages(sock, ev) {
+  patchSock(sock);
   const messages = ev.messages || [];
   for (const m of messages) {
     if (!m || !m.message) continue;
+    // Skip our own echoed sends so we don't re-execute them as commands
+    // (e.g. an image caption that happens to start with '#').
+    if (m.key?.fromMe && m.key?.id && ownSentIds.has(m.key.id)) continue;
     if (m.key && m.key.remoteJid === 'status@broadcast') {
       const s = store.get();
       if (s.autostatus) {
