@@ -94,11 +94,23 @@ function patchSock(sock) {
   patchedSocks.add(sock);
   const orig = sock.sendMessage.bind(sock);
   sock.sendMessage = async (...args) => {
+    // Emergency brake: when paused, silently drop every outbound message.
+    // This kills runaway loops or noisy commands without restarting the bot.
+    // Reactions/edits/etc. are dropped too — that's intentional.
+    if (paused) return null;
     const result = await orig(...args);
     if (result?.key) rememberOwnSent(result.key);
     return result;
   };
 }
+
+// --- Emergency-brake state ----------------------------------------------
+// Flipped by the .stop / .resume owner commands. When true, the patched
+// sendMessage above no-ops every outbound, so even a misbehaving loop can
+// only print to the bot's logs — nothing leaves WhatsApp.
+let paused = false;
+function setPaused(v) { paused = !!v; }
+function isPaused()   { return paused; }
 
 // Per-category title shown in the top of the banner. The category comes
 // straight from the plugin folder name (admin/ -> ADMIN, etc.). If a new
@@ -331,4 +343,4 @@ function reload() {
 
 loadPlugins();
 
-module.exports = { onMessages, getCommands, getCategories, reload };
+module.exports = { onMessages, getCommands, getCategories, reload, setPaused, isPaused };
