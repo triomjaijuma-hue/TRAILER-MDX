@@ -112,74 +112,93 @@ module.exports = [
     } catch (e) { reply(`Failed: ${e?.message}`); }
   } },
 
-  // .news — fetches top headlines (Google News RSS, with BBC fallback).
-  // Sends actual headline + source + snippet, not just a search URL.
-  { name: 'news', description: 'Top headlines (Google News)', handler: async ({ argText, reply }) => {
+  // .news — fetches top headlines from multiple RSS feeds.
+  // Priority: BBC World (always works) → DW English → Google News RSS
+  // For queries, all feeds are tried and results are filtered by keyword.
+  { name: 'news', description: 'Top headlines (BBC / DW / Google News)', handler: async ({ argText, reply }) => {
     const q = (argText || '').trim();
     const NEWS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
     const stripHtml = (s) => (s || '')
       .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
       .replace(/<[^>]+>/g, '')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/\s+/g, ' ')
-      .trim();
+      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/\s+/g, ' ').trim();
 
-    const parseRss = (xml) => {
-      const items = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/g)].slice(0, 8);
-      return items.map(([, body]) => {
+    const parseRss = (xml, sourceName) => {
+      const blocks = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/g)].slice(0, 20);
+      return blocks.map(([, body]) => {
         const pick = (tag) => {
-          // Match <tag> OR <tag attr="...">
-          const m = body.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`));
-          if (!m) return '';
-          return stripHtml(m[1]);
+          const m = body.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, 'i'));
+          return m ? stripHtml(m[1]) : '';
         };
+        // <link> in RSS can be a plain text element or have CDATA
+        let link = pick('link');
+        // Fallback: grab URL from <guid> if <link> is empty
+        if (!link) link = pick('guid');
+        // Fallback: grab any http URL from the item body
+        if (!link) { const mu = body.match(/https?:\/\/[^\s<"']+/); if (mu) link = mu[0]; }
         return {
           title: pick('title'),
-          link: pick('link'),
-          source: pick('source'),
+          link: link.replace(/&amp;/g, '&'),
+          source: pick('source') || sourceName,
           description: pick('description'),
-          pubDate: pick('pubDate'),
         };
-      }).filter(it => it.title && it.link);
+      }).filter(it => it.title && it.link && it.link.startsWith('http'));
     };
 
-    const sources = q
-      ? [`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`]
-      : [
-          `https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en`,
-          `https://feeds.bbci.co.uk/news/world/rss.xml`,
-        ];
+    const fetchFeed = async (url, sourceName) => {
+      const xml = await helpers.getText(url, {
+        timeout: 15000,
+        headers: { 'User-Agent': NEWS_UA, Accept: 'application/rss+xml, application/xml, text/xml, */*' },
+      });
+      return parseRss(xml, sourceName);
+    };
+
+    // Reliable feeds (BBC confirmed working; DW also reliable; Google News often blocked on servers)
+    const FEEDS = [
+      { url: 'https://feeds.bbci.co.uk/news/world/rss.xml',   name: 'BBC News' },
+      { url: 'https://rss.dw.com/rdf/rss-en-news',            name: 'DW News' },
+      { url: 'https://feeds.bbci.co.uk/news/rss.xml',         name: 'BBC News' },
+      { url: 'https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en', name: 'Google News' },
+    ];
+
+    // For a query, also try Google News search RSS
+    const QUERY_FEEDS = q ? [
+      { url: `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`, name: 'Google News' },
+      ...FEEDS,
+    ] : FEEDS;
+
+    const keywords = q.toLowerCase().split(/\s+/).filter(x => x.length > 2);
+    const matchesQuery = (item) => {
+      if (!q) return true;
+      const hay = (item.title + ' ' + item.description).toLowerCase();
+      return keywords.some(k => hay.includes(k));
+    };
 
     let parsed = [];
-    let lastErr = '';
-    for (const url of sources) {
+    const tried = [];
+    for (const feed of QUERY_FEEDS) {
+      if (tried.includes(feed.url)) continue;
+      tried.push(feed.url);
       try {
-        const xml = await helpers.getText(url, {
-          timeout: 15000,
-          headers: { 'User-Agent': NEWS_UA, Accept: 'application/rss+xml, application/xml, text/xml, */*' },
-        });
-        parsed = parseRss(xml);
-        if (parsed.length) break;
-        lastErr = 'no items in feed';
-      } catch (e) {
-        lastErr = e?.message || 'fetch failed';
-      }
+        const items = await fetchFeed(feed.url, feed.name);
+        const filtered = q ? items.filter(matchesQuery) : items;
+        if (filtered.length >= 2) { parsed = filtered.slice(0, 8); break; }
+        // Accept unfiltered if query found nothing yet
+        if (!parsed.length && items.length) parsed = items.slice(0, 8);
+      } catch (_) {}
     }
 
     if (!parsed.length) {
-      return reply(`📰 News feed unreachable (${lastErr}). Search link:\nhttps://news.google.com/search?q=${encodeURIComponent(q || 'world')}`);
+      return reply(`📰 Could not fetch news right now. Try:\nhttps://news.google.com/search?q=${encodeURIComponent(q || 'world news')}`);
     }
 
     const heading = q ? `📰 *Top News: ${q}*` : '📰 *Top Headlines*';
     const lines = parsed.map((it, i) => {
       const snippet = it.description && it.description !== it.title
-        ? `\n   ${it.description.slice(0, 180)}${it.description.length > 180 ? '…' : ''}`
+        ? `\n   ${it.description.slice(0, 160)}${it.description.length > 160 ? '…' : ''}`
         : '';
       const src = it.source ? `\n   _${it.source}_` : '';
       return `${i + 1}. *${it.title}*${src}${snippet}\n   ${it.link}`;
