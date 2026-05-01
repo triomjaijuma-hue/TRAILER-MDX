@@ -1,8 +1,9 @@
 FROM node:20-bullseye-slim
 
-# Install system deps for sharp, ffmpeg, canvas-like libs
+# Install system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    espeak-ng \
     webp \
     imagemagick \
     libwebp-dev \
@@ -11,14 +12,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     python3 \
+    python3-pip \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# yt-dlp — required for .play / .video / .ytmp3 / .ytmp4 since the public
-# wrapper APIs (cobalt, giftedtech, davidcyril, ...) are mostly dead in 2026.
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-      -o /usr/local/bin/yt-dlp \
-    && chmod +x /usr/local/bin/yt-dlp
+# yt-dlp via pip — standalone curl binary fails with Python zipimport errors;
+# pip installs a proper wrapper script that works reliably with system Python
+RUN pip3 install -U yt-dlp
 
 WORKDIR /app
 
