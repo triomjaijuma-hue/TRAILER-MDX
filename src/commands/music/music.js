@@ -35,8 +35,8 @@ const COOKIES = ensureCookies();
 const YTDLP_TMP = '/tmp/yt-dlp';
 const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
 
-function testBin(p) { return new Promise(r => { if (!p) return r(false); execFile(p, ['--version'], { timeout: 8000 }, e => r(!e)); }); }
-function sh(cmd)    { return new Promise(r => exec(cmd, { timeout: 8000 }, (e,o) => r(e?'':(o||'').trim().split('\n')[0]))); }
+function testBin(p) { return new Promise(r => { if (!p) return r(false); try { fs.accessSync(p, fs.constants.X_OK); } catch(_) { return r(false); } execFile(p, ['--version'], { timeout: 20000 }, e => r(!e)); }); }
+function sh(cmd, ms) { return new Promise(r => exec(cmd, { timeout: ms||30000 }, (e,o) => r(e?'':(o||'').trim().split('\n')[0]))); }
 
 function httpsGet(url, maxRedir) {
   maxRedir = maxRedir == null ? 8 : maxRedir;
@@ -69,26 +69,34 @@ let _ytdlpReady = null;
 function getYtdlp() {
   if (!_ytdlpReady) {
     _ytdlpReady = (async () => {
-      // Check Docker path first (Dockerfile installs here), then fall back to others
+      // Fast check: known static paths (Docker /usr/local/bin, nixpkgs profiles)
       const candidates = [
         '/usr/local/bin/yt-dlp',
         process.env.YTDLP_BIN,
+        '/root/.nix-profile/bin/yt-dlp',
+        '/nix/var/nix/profiles/default/bin/yt-dlp',
+        '/home/user/.nix-profile/bin/yt-dlp',
         path.join(__dirname, '../../../bin/yt-dlp'),
         '/usr/bin/yt-dlp', '/bin/yt-dlp',
+        YTDLP_TMP,
       ].filter(Boolean);
-      for (const p of candidates) if (await testBin(p)) { console.log('[music] yt-dlp at', p); return p; }
-      const w = await sh('which yt-dlp 2>/dev/null || command -v yt-dlp 2>/dev/null');
-      if (w && await testBin(w)) return w;
-      const f = await sh('find /nix /run /usr -name yt-dlp -type f 2>/dev/null | head -1');
-      if (f && await testBin(f)) return f;
-      if (await testBin(YTDLP_TMP)) return YTDLP_TMP;
+      for (const p of candidates) {
+        try { fs.accessSync(p, fs.constants.X_OK); console.log('[music] yt-dlp at', p); return p; } catch(_) {}
+      }
+      // Shell PATH (nix may expose binary here even if not at a fixed path)
+      const w = await sh('which yt-dlp 2>/dev/null || command -v yt-dlp 2>/dev/null', 15000);
+      if (w) { console.log('[music] yt-dlp via PATH:', w); return w; }
+      // Deep nix store search (60s — nix store can be large)
+      const f = await sh('find /nix /run -name yt-dlp -type f 2>/dev/null | head -1', 60000);
+      if (f) { console.log('[music] yt-dlp in nix store:', f); return f; }
       // Self-download as last resort
-      console.log('[music] Downloading yt-dlp...');
+      console.log('[music] yt-dlp not found — downloading...');
       try {
         await dlBin(YTDLP_URL, YTDLP_TMP);
         fs.chmodSync(YTDLP_TMP, 0o755);
-        if (await testBin(YTDLP_TMP)) { console.log('[music] yt-dlp downloaded OK'); return YTDLP_TMP; }
-      } catch(e) { console.error('[music] download failed:', e.message); }
+        if (await testBin(YTDLP_TMP)) { console.log('[music] yt-dlp self-downloaded OK'); return YTDLP_TMP; }
+      } catch(e) { console.error('[music] self-download failed:', e.message); }
+      console.error('[music] yt-dlp unavailable');
       return null;
     })();
   }
@@ -135,8 +143,8 @@ async function cobaltDownload(videoUrl) {
 }
 
 // ---------------------------------------------------------------------------
-// yt-dlp via shell exec — uses PATH, works in nix/Railway environments
-// where execFile with hardcoded paths won't find the nix-installed binary
+// yt-dlp download — uses execFile with the actual binary path found by
+// getYtdlp(), which searches nix store, profiles, and standard locations
 // ---------------------------------------------------------------------------
 const YT_CLIENTS = [
   { client: 'ios',         ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
@@ -144,25 +152,22 @@ const YT_CLIENTS = [
   { client: 'web',         ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
 ];
 
-function ytdlpShell(videoUrl, client, ua, cookiesFile) {
+function ytdlpExec(bin, videoUrl, client, ua, cookiesFile) {
   return new Promise((resolve, reject) => {
     helpers.ensureTmp();
     const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const out = path.join(config.paths.tmp, `yt_${id}.m4a`);
-    const cookPart = cookiesFile ? `--cookies "${cookiesFile}"` : '';
-    // Use exec (shell) instead of execFile so nix/PATH-installed yt-dlp is found
-    const cmd = [
-      'yt-dlp',
-      `-f "bestaudio[ext=m4a]/bestaudio/best"`,
-      `--no-playlist --no-warnings --no-check-certificate`,
-      `--extractor-args "youtube:player_client=${client}"`,
-      `--user-agent "${ua}"`,
-      `--max-filesize 75m --socket-timeout 45 --retries 2`,
-      cookPart,
-      `-o "${out}"`,
-      `"${videoUrl}"`,
-    ].filter(Boolean).join(' ');
-    exec(cmd, { timeout: 240000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
+    const args = [
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      '--no-playlist', '--no-warnings', '--no-check-certificate',
+      '--extractor-args', `youtube:player_client=${client}`,
+      '--user-agent', ua,
+      '--max-filesize', '75m',
+      '--socket-timeout', '45', '--retries', '2',
+      ...(cookiesFile ? ['--cookies', cookiesFile] : []),
+      '-o', out, videoUrl,
+    ];
+    execFile(bin, args, { timeout: 240000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
       if (err) {
         try { fs.unlinkSync(out); } catch(_) {}
         const msg = (se || err.message || '').split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 250);
@@ -177,18 +182,6 @@ function ytdlpShell(videoUrl, client, ua, cookiesFile) {
   });
 }
 
-// Check if yt-dlp is available in the shell PATH (cached)
-let _ytdlpInPath = null;
-function checkYtdlpInPath() {
-  if (_ytdlpInPath === null) {
-    _ytdlpInPath = new Promise(r => {
-      exec('yt-dlp --version', { timeout: 12000 }, e => r(!e));
-    });
-  }
-  return _ytdlpInPath;
-}
-checkYtdlpInPath(); // warm up at startup
-
 async function downloadAudio(url) {
   const errs = [];
 
@@ -197,16 +190,16 @@ async function downloadAudio(url) {
     return await cobaltDownload(url);
   } catch(e) { errs.push('cobalt: ' + (e.message||'').slice(0, 100)); }
 
-  // Strategy 2: yt-dlp via shell PATH (works in nixpacks/Railway, Docker)
-  const hasYtdlp = await checkYtdlpInPath();
-  if (hasYtdlp) {
+  // Strategy 2: yt-dlp with actual binary path (getYtdlp searches nix store, profiles, etc.)
+  const ytBin = await getYtdlp();
+  if (ytBin) {
     const cookiesFile = ensureCookies();
     for (const { client, ua } of YT_CLIENTS) {
-      try { return await ytdlpShell(url, client, ua, cookiesFile); }
+      try { return await ytdlpExec(ytBin, url, client, ua, cookiesFile); }
       catch(e) { errs.push(`yt-dlp[${client}]: ${(e.message||'').slice(0, 100)}`); }
     }
   } else {
-    errs.push('yt-dlp: not found in PATH');
+    errs.push('yt-dlp: binary not found');
   }
 
   // Strategy 3: Invidious public instances (updated list)
