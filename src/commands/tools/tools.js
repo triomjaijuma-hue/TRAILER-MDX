@@ -136,34 +136,48 @@ module.exports = [
   { name: 'tts', description: 'Text to speech', handler: async ({ sock, jid, m, argText, reply }) => {
     if (!argText) return reply('Usage: .tts <text>');
     const text = String(argText).slice(0, 300);
-    const { exec } = require('child_process');
+    const { execFile } = require('child_process');
     const fs = require('fs');
 
-    // espeak-ng → OGG Opus via ffmpeg (fully offline, no external API)
-    async function espeakTTS() {
-      return new Promise((resolve, reject) => {
-        const id = Date.now();
-        const wav = `/tmp/tts_${id}.wav`;
-        const ogg = `/tmp/tts_${id}.ogg`;
-        // Escape the text safely for shell
-        const safe = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-        exec(
-          `espeak-ng -v en -s 145 -p 50 "${safe}" -w "${wav}" && ffmpeg -y -i "${wav}" -c:a libopus -ar 48000 -b:a 64k "${ogg}"`,
-          { timeout: 30000 },
-          err => {
-            try { fs.unlinkSync(wav); } catch(_) {}
-            if (err) { try { fs.unlinkSync(ogg); } catch(_) {} return reject(new Error('espeak-ng: ' + err.message)); }
-            try { const buf = fs.readFileSync(ogg); fs.unlinkSync(ogg); resolve(buf); }
-            catch(e) { reject(e); }
-          }
-        );
-      });
+    const id  = Date.now();
+    const wav = `/tmp/tts_${id}.wav`;
+    const ogg = `/tmp/tts_${id}.ogg`;
+
+    function cleanup() {
+      try { fs.unlinkSync(wav); } catch(_) {}
+      try { fs.unlinkSync(ogg); } catch(_) {}
     }
 
     try {
-      const ogg = await espeakTTS();
-      await sock.sendMessage(jid, { audio: ogg, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: m });
-    } catch(e) { reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`); }
+      // Step 1: espeak-ng → WAV (installed via apt, always in /usr/bin/espeak-ng)
+      await new Promise((resolve, reject) => {
+        execFile('espeak-ng', ['-v', 'en', '-s', '145', '-p', '50', text, '-w', wav],
+          { timeout: 15000 },
+          (err, _out, stderr) => err ? reject(new Error('espeak-ng: ' + (stderr||err.message).slice(0,200))) : resolve()
+        );
+      });
+
+      // Verify WAV was created and has content
+      if (!fs.existsSync(wav) || fs.statSync(wav).size < 100) throw new Error('espeak-ng produced empty output');
+
+      // Step 2: WAV → OGG Opus (same pattern as audiofx which works correctly)
+      await new Promise((resolve, reject) => {
+        execFile('ffmpeg', ['-y', '-i', wav, '-c:a', 'libopus', '-ar', '48000', '-ac', '1', '-b:a', '128k', ogg],
+          { timeout: 20000 },
+          (err, _out, stderr) => err ? reject(new Error('ffmpeg: ' + (stderr||err.message).slice(0,200))) : resolve()
+        );
+      });
+
+      // Verify OGG was created and has content
+      if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 100) throw new Error('ffmpeg produced empty output');
+
+      const buf = fs.readFileSync(ogg);
+      cleanup();
+      await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: m });
+    } catch(e) {
+      cleanup();
+      reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`);
+    }
   } },
   { name: 'vnote', description: 'Convert quoted audio to voice note', handler: async ({ sock, jid, m, reply }) => {
     const buf = await getQuotedMediaBuffer(m);
