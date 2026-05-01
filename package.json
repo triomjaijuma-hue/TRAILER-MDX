@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node src/index.js",
-    "postinstall": "node -e \"const{execFileSync:x,execSync:xs}=require('child_process'),fs=require('fs'),path=require('path'),os=require('os');const b=path.join(__dirname,'bin');try{fs.mkdirSync(b,{recursive:true})}catch(_){};const out=path.join(b,'yt-dlp');if(fs.existsSync(out)&&fs.statSync(out).size>1000000)return;const plat=os.platform();const url=plat==='win32'?'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe':'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';try{xs('curl -fsSL '+url+' -o '+out);if(plat!=='win32')fs.chmodSync(out,0o755);console.log('yt-dlp downloaded to',out)}catch(e){console.warn('[postinstall] yt-dlp download failed:',e.message)}\""
+    "postinstall": "node scripts/postinstall.js"
   },
   "engines": {
     "node": ">=20"
