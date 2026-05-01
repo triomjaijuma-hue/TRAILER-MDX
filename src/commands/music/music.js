@@ -7,13 +7,10 @@ const path = require('path');
 const helpers = require('../../lib/helpers');
 const config = require('../../lib/config');
 
-const MAX_MEDIA_BYTES = 14 * 1024 * 1024;
+const MAX_MEDIA_BYTES = 50 * 1024 * 1024; // 50 MB — WhatsApp hard limit
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// --- yt-dlp binary -------------------------------------------------------
-// Dockerfile/nixpacks installs yt-dlp system-wide. The postinstall script
-// also downloads it to ./bin/yt-dlp so it works on platforms that don't
-// build from our Dockerfile (Railway nixpacks, raw VPS, etc.).
+// --- yt-dlp --------------------------------------------------------------
 const _BIN_PATHS = [
   process.env.YTDLP_BIN,
   path.join(__dirname, '../../../bin/yt-dlp'),
@@ -27,10 +24,7 @@ function probeYtdlp() {
   return new Promise((resolve) => {
     let tried = 0;
     const tryNext = () => {
-      if (tried >= _BIN_PATHS.length) {
-        ytdlpAvailable = false;
-        return resolve(false);
-      }
+      if (tried >= _BIN_PATHS.length) { ytdlpAvailable = false; return resolve(false); }
       const bin = _BIN_PATHS[tried++];
       execFile(bin, ['--version'], { timeout: 5000 }, (err) => {
         if (!err) { ytdlpBin = bin; ytdlpAvailable = true; return resolve(true); }
@@ -55,16 +49,20 @@ function ytdlpDownload(url, kind) {
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificate',
+      // Use web_embedded player — bypasses YouTube PO-token bot detection
+      // on cloud-server IPs without needing cookies or OAuth.
+      '--extractor-args', 'youtube:player_client=web_embedded,web',
+      '--user-agent', UA,
       '--max-filesize', String(MAX_MEDIA_BYTES),
-      '--socket-timeout', '20',
-      '--retries', '2',
+      '--socket-timeout', '30',
+      '--retries', '3',
       '-o', out,
       url,
     ];
-    execFile(ytdlpBin || 'yt-dlp', args, { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }, (err, _so, se) => {
+    execFile(ytdlpBin || 'yt-dlp', args, { timeout: 180000, maxBuffer: 64 * 1024 * 1024 }, (err, _so, se) => {
       if (err) {
         try { fs.unlinkSync(out); } catch (_) {}
-        const msg = (se || err.message || '').toString().split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 300);
+        const msg = (se || err.message || '').toString().split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 300);
         return reject(new Error(msg || 'yt-dlp failed'));
       }
       try {
@@ -77,8 +75,7 @@ function ytdlpDownload(url, kind) {
   });
 }
 
-// --- @distube/ytdl-core (already in package.json) -----------------------
-// Load lazily so a missing package doesn't crash the whole bot.
+// --- @distube/ytdl-core --------------------------------------------------
 let _ytdl;
 function getYtdl() {
   if (_ytdl !== undefined) return _ytdl;
@@ -90,21 +87,16 @@ function getYtdl() {
 async function ytdlCoreDownload(url, kind) {
   const ytdl = getYtdl();
   if (!ytdl) throw new Error('ytdl-core not available');
-
-  // getBasicInfo is lighter and avoids heavy signature decryption
   const info = await ytdl.getInfo(url, {
     requestOptions: { headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' } },
   });
-
   let format;
   if (kind === 'audio') {
-    // Prefer m4a/mp4a for direct download (already muxed, no ffmpeg needed)
     format = info.formats
       .filter(f => f.hasAudio && !f.hasVideo && (f.container === 'm4a' || f.mimeType?.includes('audio/mp4')))
       .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
     if (!format) format = ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
   } else {
-    // Combined mp4 ≤ 480 p — avoids needing ffmpeg to mux
     format = info.formats
       .filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4' && (f.height || 720) <= 480)
       .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
@@ -112,7 +104,6 @@ async function ytdlCoreDownload(url, kind) {
     if (!format) format = ytdl.chooseFormat(info.formats, { filter: 'videoandaudio' });
   }
   if (!format?.url) throw new Error('no suitable ytdl-core format');
-
   const r = await axios.get(format.url, {
     responseType: 'arraybuffer',
     timeout: 90000,
@@ -125,15 +116,15 @@ async function ytdlCoreDownload(url, kind) {
   return buf;
 }
 
-// --- Invidious (most reliable free cloud-server approach in 2026) --------
-// Invidious is a YouTube front-end that exposes direct stream URLs via API.
-// These URLs are signed by YouTube for a short time and work without cookies.
+// --- Invidious -----------------------------------------------------------
 const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
   'https://invidious.privacydev.net',
   'https://yt.artemislena.eu',
   'https://invidious.nerdvpn.de',
   'https://iv.ggtyler.dev',
+  'https://invidious.lunar.icu',
+  'https://invidious.fdn.fr',
 ];
 
 function videoIdFromUrl(url) {
@@ -151,27 +142,64 @@ async function invidiosFetch(ytUrl, kind) {
         { timeout: 14000, headers: { 'User-Agent': UA } },
       );
       if (kind === 'video') {
-        // formatStreams = combined audio+video streams (best for sending)
         const streams = (data?.formatStreams || []).filter(f => f.type?.includes('video/mp4'));
-        // Prefer 480p or lower to stay under 50 MB
         const pick = streams.find(f => (f.quality || '').includes('480'))
                   || streams.find(f => (f.quality || '').includes('360'))
                   || streams.find(f => (f.quality || '').includes('720'))
                   || streams[0];
-        if (pick?.url) return { directUrl: pick.url, source: `invidious` };
+        if (pick?.url) return { directUrl: pick.url, source: 'invidious' };
       } else {
-        // For audio prefer m4a adaptive stream
         const adaptives = data?.adaptiveFormats || [];
         const pick = adaptives.find(f => f.type?.includes('audio/mp4'))
                   || adaptives.find(f => f.audioSampleRate);
-        if (pick?.url) return { directUrl: pick.url, source: `invidious` };
+        if (pick?.url) return { directUrl: pick.url, source: 'invidious' };
       }
     } catch (_) {}
   }
   throw new Error('all invidious instances failed');
 }
 
-// --- API provider fallbacks ---------------------------------------------
+// --- Piped ---------------------------------------------------------------
+// Piped is another YouTube front-end — stream URLs are different from
+// Invidious so they serve as an independent fallback.
+const PIPED_STREAM_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://piped-api.garudalinux.org',
+  'https://pipedapi.r4fo.com',
+  'https://piped.video/api',
+];
+
+async function pipedFetch(ytUrl, kind) {
+  const videoId = videoIdFromUrl(ytUrl);
+  if (!videoId) throw new Error('could not parse video id');
+  for (const base of PIPED_STREAM_INSTANCES) {
+    try {
+      const data = await helpers.getJson(
+        `${base}/streams/${videoId}`,
+        { timeout: 14000, headers: { 'User-Agent': UA } },
+      );
+      if (kind === 'audio') {
+        const streams = (data?.audioStreams || []).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        const pick = streams[0];
+        if (pick?.url) return { directUrl: pick.url, source: 'piped' };
+      } else {
+        // videoStreams that are NOT video-only (combined) or fall back to highest res video-only
+        const streams = (data?.videoStreams || [])
+          .filter(s => s.mimeType?.includes('mp4'))
+          .sort((a, b) => (b.height || 0) - (a.height || 0));
+        const pick = streams.find(s => !s.videoOnly && (s.height || 0) <= 480)
+                  || streams.find(s => !s.videoOnly)
+                  || streams.find(s => (s.height || 0) <= 480)
+                  || streams[0];
+        if (pick?.url) return { directUrl: pick.url, source: 'piped' };
+      }
+    } catch (_) {}
+  }
+  throw new Error('all piped instances failed');
+}
+
+// --- API wrapper fallbacks -----------------------------------------------
 const AUDIO_PROVIDERS = [
   {
     name: 'davidcyril',
@@ -184,7 +212,6 @@ const AUDIO_PROVIDERS = [
     pick: (d) => d?.result?.url || d?.url,
   },
 ];
-
 const VIDEO_PROVIDERS = [
   {
     name: 'davidcyril',
@@ -202,11 +229,7 @@ async function resolveDirectUrl(providers, ytUrl) {
   const errors = [];
   for (const p of providers) {
     try {
-      const cfg = {
-        timeout: 25000,
-        headers: { 'User-Agent': UA, Accept: 'application/json', 'Content-Type': 'application/json' },
-        validateStatus: () => true,
-      };
+      const cfg = { timeout: 25000, headers: { 'User-Agent': UA, Accept: 'application/json' }, validateStatus: () => true };
       const r = p.method === 'POST'
         ? await axios.post(p.build(ytUrl), p.body(ytUrl), cfg)
         : await axios.get(p.build(ytUrl), cfg);
@@ -214,9 +237,7 @@ async function resolveDirectUrl(providers, ytUrl) {
       const direct = p.pick(r.data);
       if (direct && /^https?:\/\//.test(direct)) return { direct, source: p.name };
       errors.push(`${p.name}: no url in response`);
-    } catch (e) {
-      errors.push(`${p.name}: ${e.message?.slice(0, 80) || 'failed'}`);
-    }
+    } catch (e) { errors.push(`${p.name}: ${e.message?.slice(0, 60) || 'failed'}`); }
   }
   throw new Error(errors.join(' | ') || 'no provider responded');
 }
@@ -224,7 +245,7 @@ async function resolveDirectUrl(providers, ytUrl) {
 async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
   const r = await axios.get(url, {
     responseType: 'arraybuffer',
-    timeout: 90000,
+    timeout: 120000,
     maxContentLength: cap,
     maxBodyLength: cap,
     headers: { 'User-Agent': UA },
@@ -234,52 +255,51 @@ async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
   return buf;
 }
 
-// --- Main download function: yt-dlp → invidious → ytdl-core → API wrappers -
+// --- Main download chain -------------------------------------------------
+// yt-dlp (with player_client bypass) → Invidious → Piped → ytdl-core → API wrappers
 async function fetchYouTubeMedia(url, kind) {
   const errors = [];
 
-  // 1. yt-dlp (most reliable — needs binary in PATH or ./bin/)
+  // 1. yt-dlp — most reliable; Dockerfile installs it system-wide.
+  //    Uses web_embedded player client to skip PO-token bot detection.
   if (await probeYtdlp()) {
-    try {
-      const buf = await ytdlpDownload(url, kind);
-      return { buf, source: 'yt-dlp' };
-    } catch (e) { errors.push(`yt-dlp: ${e.message}`); }
+    try { return { buf: await ytdlpDownload(url, kind), source: 'yt-dlp' }; }
+    catch (e) { errors.push(`yt-dlp: ${e.message?.slice(0, 150)}`); }
   } else {
-    errors.push('yt-dlp: not installed');
+    errors.push('yt-dlp: not in PATH');
   }
 
-  // 2. Invidious — public instances expose signed direct URLs, no auth needed.
-  //    Most reliable free approach from cloud servers where YouTube blocks scrapers.
+  // 2. Invidious public instances
   try {
     const { directUrl, source } = await invidiosFetch(url, kind);
-    const buf = await downloadCapped(directUrl);
-    return { buf, source };
-  } catch (e) { errors.push(`invidious: ${e.message?.slice(0, 120)}`); }
+    return { buf: await downloadCapped(directUrl), source };
+  } catch (e) { errors.push(`invidious: ${e.message?.slice(0, 100)}`); }
 
-  // 3. @distube/ytdl-core (often blocked by YouTube bot detection in 2026)
+  // 3. Piped public instances (different CDN from Invidious)
   try {
-    const buf = await ytdlCoreDownload(url, kind);
-    return { buf, source: 'ytdl-core' };
-  } catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 120)}`); }
+    const { directUrl, source } = await pipedFetch(url, kind);
+    return { buf: await downloadCapped(directUrl), source };
+  } catch (e) { errors.push(`piped: ${e.message?.slice(0, 100)}`); }
 
-  // 4. Community wrapper APIs (best-effort)
+  // 4. ytdl-core (often blocked on cloud IPs in 2026 but worth trying)
+  try { return { buf: await ytdlCoreDownload(url, kind), source: 'ytdl-core' }; }
+  catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 100)}`); }
+
+  // 5. Community wrapper APIs
   const providers = kind === 'audio' ? AUDIO_PROVIDERS : VIDEO_PROVIDERS;
   try {
     const { direct, source } = await resolveDirectUrl(providers, url);
-    const buf = await downloadCapped(direct);
-    return { buf, source };
+    return { buf: await downloadCapped(direct), source };
   } catch (e) { errors.push(e.message); }
 
   throw new Error(errors.join(' | '));
 }
 
 // --- Search --------------------------------------------------------------
-
 async function search(q) {
   const r = await ytSearchSafe(q);
   const vids = r?.videos || [];
   if (!vids.length) return null;
-
   const tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
   const scoreOf = (v) => {
     const title = (v.title || '').toLowerCase();
@@ -300,10 +320,7 @@ async function search(q) {
     score += Math.min(3, Math.log10((v.views || 1) + 1) / 2);
     return score;
   };
-
-  return vids.slice(0, 15)
-    .map(v => ({ v, s: scoreOf(v) }))
-    .sort((a, b) => b.s - a.s)[0]?.v || vids[0];
+  return vids.slice(0, 15).map(v => ({ v, s: scoreOf(v) })).sort((a, b) => b.s - a.s)[0]?.v || vids[0];
 }
 
 async function ytSearchSafe(query) {
@@ -331,14 +348,9 @@ async function ytSearchScrape(query) {
       if (!v?.videoId) continue;
       const title = v.title?.runs?.[0]?.text || '';
       const lengthText = v.lengthText?.simpleText || '';
-      const seconds = (() => {
-        const parts = lengthText.split(':').map(Number);
-        if (parts.some(isNaN)) return 0;
-        return parts.reduce((a, b) => a * 60 + b, 0);
-      })();
+      const seconds = (() => { const p = lengthText.split(':').map(Number); return p.some(isNaN) ? 0 : p.reduce((a, b) => a * 60 + b, 0); })();
       out.push({
-        title,
-        videoId: v.videoId,
+        title, videoId: v.videoId,
         url: `https://www.youtube.com/watch?v=${v.videoId}`,
         author: { name: v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || '' },
         duration: { seconds, timestamp: lengthText },
@@ -352,32 +364,22 @@ async function ytSearchScrape(query) {
   return { videos: out };
 }
 
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://pipedapi.r4fo.com',
-];
-
+const PIPED_INSTANCES = ['https://pipedapi.kavin.rocks', 'https://pipedapi.adminforge.de', 'https://pipedapi.r4fo.com'];
 async function ytSearchPiped(query) {
   for (const base of PIPED_INSTANCES) {
     try {
-      const data = await helpers.getJson(
-        `${base}/search?q=${encodeURIComponent(query)}&filter=videos`,
-        { timeout: 12000 },
-      );
+      const data = await helpers.getJson(`${base}/search?q=${encodeURIComponent(query)}&filter=videos`, { timeout: 12000 });
       const items = (data?.items || []).filter(x => x.url || x.videoId);
       if (!items.length) continue;
       return {
         videos: items.slice(0, 20).map(x => {
           const id = x.videoId || (x.url || '').split('?v=').pop();
           return {
-            title: x.title || '',
-            videoId: id,
+            title: x.title || '', videoId: id,
             url: `https://www.youtube.com/watch?v=${id}`,
             author: { name: x.uploaderName || x.uploader || '' },
             duration: { seconds: x.duration || 0, timestamp: secsToStamp(x.duration) },
-            timestamp: secsToStamp(x.duration),
-            views: x.views || 0,
+            timestamp: secsToStamp(x.duration), views: x.views || 0,
           };
         }),
       };
@@ -388,59 +390,39 @@ async function ytSearchPiped(query) {
 
 function secsToStamp(s) {
   if (!s || s < 0) return '';
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
-  return `${m}:${String(sec).padStart(2, '0')}`;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  return `${m}:${String(sec).padStart(2,'0')}`;
 }
 
-// --- Lyrics -------------------------------------------------------------
-
+// --- Lyrics --------------------------------------------------------------
 async function fetchLyrics(query) {
   const parts = query.split(/\s*-\s*/);
   const artist = parts.length > 1 ? (parts[0] || '').trim() : '';
   const song   = (parts.length > 1 ? parts.slice(1).join(' - ') : query).trim();
-
   try {
-    const data = await helpers.getJson(
-      `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
-      { timeout: 12000 },
-    );
+    const data = await helpers.getJson(`https://lrclib.net/api/search?q=${encodeURIComponent(query)}`, { timeout: 12000 });
     const hit = Array.isArray(data) ? data.find(x => x.plainLyrics || x.syncedLyrics) : null;
     const text = hit?.plainLyrics || stripLrcTimestamps(hit?.syncedLyrics);
     if (text) return { text, title: hit ? `${hit.artistName} — ${hit.trackName}` : null };
   } catch (_) {}
-
   if (artist && song) {
     try {
-      const data = await helpers.getJson(
-        `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(song)}`,
-        { timeout: 12000 },
-      );
+      const data = await helpers.getJson(`https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(song)}`, { timeout: 12000 });
       const text = data?.plainLyrics || stripLrcTimestamps(data?.syncedLyrics);
       if (text) return { text, title: `${data.artistName} — ${data.trackName}` };
     } catch (_) {}
   }
-
   if (artist && song && artist !== song) {
     try {
-      const data = await helpers.getJson(
-        `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(song)}`,
-        { timeout: 12000 },
-      );
+      const data = await helpers.getJson(`https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(song)}`, { timeout: 12000 });
       if (data?.lyrics) return { text: data.lyrics, title: `${artist} — ${song}` };
     } catch (_) {}
   }
-
   try {
-    const data = await helpers.getJson(
-      `https://some-random-api.com/lyrics?title=${encodeURIComponent(query)}`,
-      { timeout: 12000 },
-    );
+    const data = await helpers.getJson(`https://some-random-api.com/lyrics?title=${encodeURIComponent(query)}`, { timeout: 12000 });
     if (data?.lyrics) return { text: data.lyrics, title: data.title ? `${data.author || ''} — ${data.title}` : null };
   } catch (_) {}
-
   return null;
 }
 
@@ -449,7 +431,7 @@ function stripLrcTimestamps(s) {
   return s.replace(/\[\d{2}:\d{2}(?:\.\d{1,3})?\]\s?/g, '').trim();
 }
 
-// --- Commands -----------------------------------------------------------
+// --- Commands ------------------------------------------------------------
 module.exports = [
   {
     name: 'ytsearch', aliases: ['ysearch'],
@@ -460,10 +442,8 @@ module.exports = [
         const r = await ytSearchSafe(argText);
         const top = (r?.videos || []).slice(0, 6);
         if (!top.length) return reply('Nothing found.');
-        reply(top.map(v => `• ${v.title}\n  ${v.timestamp || v.duration?.timestamp || ''} · ${v.author?.name || ''}\n  ${v.url}`).join('\n\n'));
-      } catch (e) {
-        reply(`YouTube search failed: ${e?.message?.slice(0, 200) || 'unknown'}`);
-      }
+        reply(top.map(v => `• ${v.title}\n  ${v.timestamp || ''} · ${v.author?.name || ''}\n  ${v.url}`).join('\n\n'));
+      } catch (e) { reply(`Search failed: ${e?.message?.slice(0, 200) || 'unknown'}`); }
     },
   },
   {
@@ -471,20 +451,16 @@ module.exports = [
     description: 'Send audio for a song name',
     handler: async ({ argText, sock, jid, m, reply }) => {
       if (!argText) return reply('Usage: .play <song name>');
-      await reply(`🔎 Searching for *${argText}*...`);
+      await reply(`🔎 Searching *${argText}*...`);
       const v = await search(argText);
       if (!v) return reply('Not found on YouTube.');
+      await reply(`🎵 Found: *${v.title}* — downloading...`);
       try {
         const { buf, source } = await fetchYouTubeMedia(v.url, 'audio');
-        await sock.sendMessage(jid, {
-          audio: buf,
-          mimetype: 'audio/mp4',
-          ptt: false,
-          fileName: `${v.title}.mp3`,
-        }, { quoted: m });
-        await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || v.duration?.timestamp || ''}\n${v.url}\n_via ${source}_`);
+        await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mp4', ptt: false, fileName: `${v.title}.mp3` }, { quoted: m });
+        await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || v.duration?.timestamp || ''}\n_via ${source}_`);
       } catch (e) {
-        reply(`❌ Audio download failed.\n\n*${v.title}*\n${v.url}\n\n_${e.message?.slice(0, 250)}_`);
+        reply(`❌ Download failed for *${v.title}*\n_${e.message?.slice(0, 200)}_`);
       }
     },
   },
@@ -493,30 +469,29 @@ module.exports = [
     description: 'Send video for a song/clip name',
     handler: async ({ argText, sock, jid, m, reply }) => {
       if (!argText) return reply('Usage: .video <name>');
-      await reply(`🔎 Searching for *${argText}*...`);
+      await reply(`🔎 Searching *${argText}*...`);
       const v = await search(argText);
       if (!v) return reply('Not found on YouTube.');
+      await reply(`🎬 Found: *${v.title}* — downloading...`);
       try {
         const { buf, source } = await fetchYouTubeMedia(v.url, 'video');
-        await sock.sendMessage(jid, { video: buf, mimetype: 'video/mp4', caption: `${v.title}\n_via ${source}_` }, { quoted: m });
+        await sock.sendMessage(jid, { video: buf, mimetype: 'video/mp4', caption: `🎬 *${v.title}*\n_via ${source}_` }, { quoted: m });
       } catch (e) {
-        reply(`❌ Video download failed.\n*${v.title}*\n${v.url}\n_${e.message?.slice(0, 250)}_\n\n_Try .play ${argText} for audio only._`);
+        reply(`❌ Video download failed for *${v.title}*\n_${e.message?.slice(0, 200)}_\n\n_Try *.play ${argText}* for audio instead._`);
       }
     },
   },
   {
-    name: 'lyrics', description: 'Fetch lyrics',
+    name: 'lyrics', description: 'Fetch song lyrics',
     handler: async ({ argText, reply }) => {
-      if (!argText) return reply('Usage: .lyrics <song name>  or  .lyrics <artist> - <song>');
+      if (!argText) return reply('Usage: .lyrics <song>  or  .lyrics <artist> - <song>');
       try {
         const result = await fetchLyrics(argText);
         if (!result) return reply('No lyrics found. Try `.lyrics <artist> - <song>`.');
         const header = result.title ? `🎤 *${result.title}*\n\n` : '';
         const body = result.text.length > 3500 ? result.text.slice(0, 3500) + '\n\n_…truncated_' : result.text;
         reply(header + body);
-      } catch (e) {
-        reply(`Lyrics service unavailable: ${e.message?.slice(0, 120)}`);
-      }
+      } catch (e) { reply(`Lyrics service unavailable: ${e.message?.slice(0, 120)}`); }
     },
   },
   {
