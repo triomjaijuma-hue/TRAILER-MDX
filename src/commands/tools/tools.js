@@ -136,7 +136,6 @@ module.exports = [
   { name: 'tts', description: 'Text to speech', handler: async ({ sock, jid, m, argText, reply }) => {
     if (!argText) return reply('Usage: .tts <text>');
     const text = String(argText).slice(0, 300);
-    const axios = require('axios');
     const { exec } = require('child_process');
     const fs = require('fs');
 
@@ -161,34 +160,8 @@ module.exports = [
       });
     }
 
-    // StreamElements fallback (works if the server's IP isn't blocked)
-    async function streamElementsTTS() {
-      const r = await axios.get(
-        `https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=${encodeURIComponent(text)}`,
-        { responseType: 'arraybuffer', timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } }
-      );
-      const ct = String(r.headers['content-type'] || '');
-      if (!ct.includes('audio') && !ct.includes('mpeg') && !ct.includes('mp3')) throw new Error('not audio: ' + ct);
-      const mp3 = Buffer.from(r.data);
-      if (mp3.length < 512) throw new Error('response too small');
-      // Convert MP3 → OGG Opus for WhatsApp voice notes
-      return new Promise((resolve, reject) => {
-        const id = Date.now();
-        const inp = `/tmp/tts_${id}.mp3`;
-        const out = `/tmp/tts_${id}.ogg`;
-        fs.writeFileSync(inp, mp3);
-        exec(`ffmpeg -y -i "${inp}" -c:a libopus -ar 48000 -b:a 64k "${out}"`, { timeout: 30000 }, err => {
-          try { fs.unlinkSync(inp); } catch(_) {}
-          if (err) { try { fs.unlinkSync(out); } catch(_) {} return reject(err); }
-          try { const buf = fs.readFileSync(out); fs.unlinkSync(out); resolve(buf); } catch(e) { reject(e); }
-        });
-      });
-    }
-
     try {
-      let ogg;
-      try { ogg = await espeakTTS(); }
-      catch(_) { ogg = await streamElementsTTS(); }
+      const ogg = await espeakTTS();
       await sock.sendMessage(jid, { audio: ogg, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: m });
     } catch(e) { reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`); }
   } },
