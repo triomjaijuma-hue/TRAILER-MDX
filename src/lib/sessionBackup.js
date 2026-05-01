@@ -38,7 +38,10 @@ const { spawnSync } = require('child_process');
 const config = require('./config');
 const logger = require('./logger');
 
-const TOKEN  = process.env.SESSION_BACKUP_TOKEN || '';
+const TOKEN  = process.env.SESSION_BACKUP_TOKEN
+  || process.env.GITHUB_PERSONAL_ACCESS_TOKEN
+  || process.env.GITHUB_PAT
+  || '';
 const SECRET = process.env.SESSION_SECRET || '';
 const REPO   = process.env.SESSION_BACKUP_REPO   ||
   `${process.env.UPDATE_REPO_USER || 'triomjaijuma-hue'}/${process.env.UPDATE_REPO_NAME || 'TRAILER-MDX'}`;
