@@ -5,6 +5,7 @@
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
+    "postinstall": "node scripts/postinstall.js",
     "start": "node src/index.js",
     "dev": "node src/index.js"
   },
