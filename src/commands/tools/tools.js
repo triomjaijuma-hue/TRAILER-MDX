@@ -137,28 +137,59 @@ module.exports = [
     if (!argText) return reply('Usage: .tts <text>');
     const text = String(argText).slice(0, 300);
     const axios = require('axios');
-    const tryTTS = async (url, headers = {}) => {
-      const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0', ...headers } });
-      const buf = Buffer.from(r.data);
-      if (buf.length < 512) throw new Error('empty audio response');
-      return buf;
-    };
-    try {
-      // Primary: StreamElements TTS (Brian voice — free, no auth, server-friendly)
-      let buf;
+    const { exec } = require('child_process');
+    const fs = require('fs');
+
+    // Fetch raw MP3 from a TTS provider
+    async function getMp3() {
+      // Provider 1: StreamElements (Brian voice, free, no auth)
       try {
-        buf = await tryTTS(`https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=${encodeURIComponent(text)}`);
-      } catch (_) {
-        // Fallback: TikTok TTS proxy (POST)
-        const r2 = await axios.post('https://tiktok-tts.weilnet.workers.dev/api/generation',
-          { text, voice: 'en_us_001' },
-          { responseType: 'arraybuffer', timeout: 20000, headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' } }
+        const r = await axios.get(
+          `https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=${encodeURIComponent(text)}`,
+          { responseType: 'arraybuffer', timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } }
         );
-        buf = Buffer.from(r2.data);
-        if (buf.length < 512) throw new Error('TTS response empty');
-      }
-      await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mpeg', ptt: true }, { quoted: m });
-    } catch (e) { reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`); }
+        const ct = String(r.headers['content-type'] || '');
+        if (!ct.includes('audio') && !ct.includes('mpeg') && !ct.includes('mp3')) throw new Error('not audio: ' + ct);
+        const buf = Buffer.from(r.data);
+        if (buf.length < 512) throw new Error('response too small');
+        return buf;
+      } catch(_) {}
+
+      // Provider 2: TikTok TTS — returns JSON { success, audio: base64mp3 }
+      try {
+        const r = await axios.post(
+          'https://tiktok-tts.weilnet.workers.dev/api/generation',
+          { text, voice: 'en_us_001' },
+          { timeout: 20000, headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' } }
+        );
+        if (!r.data?.success || !r.data?.audio) throw new Error('TikTok TTS: no audio in response');
+        return Buffer.from(r.data.audio, 'base64');
+      } catch(_) {}
+
+      throw new Error('all TTS providers failed — StreamElements and TikTok both unreachable');
+    }
+
+    // Convert MP3 → OGG Opus using ffmpeg (required for WhatsApp voice notes)
+    function toOgg(mp3Buf) {
+      return new Promise((resolve, reject) => {
+        const id = Date.now();
+        const inp = `/tmp/tts_${id}.mp3`;
+        const out = `/tmp/tts_${id}.ogg`;
+        fs.writeFileSync(inp, mp3Buf);
+        exec(`ffmpeg -y -i "${inp}" -c:a libopus -ar 48000 -b:a 64k "${out}"`, { timeout: 30000 }, err => {
+          try { fs.unlinkSync(inp); } catch(_) {}
+          if (err) { try { fs.unlinkSync(out); } catch(_) {} return reject(new Error('ffmpeg: ' + err.message)); }
+          try { const buf = fs.readFileSync(out); fs.unlinkSync(out); resolve(buf); }
+          catch(e) { reject(e); }
+        });
+      });
+    }
+
+    try {
+      const mp3 = await getMp3();
+      const ogg = await toOgg(mp3);
+      await sock.sendMessage(jid, { audio: ogg, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: m });
+    } catch(e) { reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`); }
   } },
   { name: 'vnote', description: 'Convert quoted audio to voice note', handler: async ({ sock, jid, m, reply }) => {
     const buf = await getQuotedMediaBuffer(m);
