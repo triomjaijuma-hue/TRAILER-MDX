@@ -133,7 +133,7 @@ module.exports = [
     } catch (_) {}
     reply('Translate failed — all providers unreachable. Try again in a moment.');
   } },
-  { name: 'tts', description: 'Text to speech', handler: async ({ sock, jid, m, argText, reply }) => {
+  { name: 'tts', aliases: ['say'], description: 'Convert text to a voice note', handler: async ({ sock, jid, m, argText, reply }) => {
     if (!argText) return reply('Usage: .tts <text>');
     const text = String(argText).slice(0, 200);
     const { execFile, exec } = require('child_process');
@@ -142,87 +142,109 @@ module.exports = [
 
     const id  = Date.now();
     const ogg = `/tmp/tts_${id}.ogg`;
-    function cleanup() { try { fs.unlinkSync(ogg); } catch(_) {} }
+    function cleanup() {
+      [ogg, `/tmp/tts_${id}_in.mp3`, `/tmp/tts_${id}_in.wav`].forEach(f => { try { fs.unlinkSync(f); } catch (_) {} });
+    }
 
-    // Convert any audio buffer (mp3/wav) → OGG Opus for WhatsApp voice notes
+    // Convert any audio buffer (mp3/wav) → OGG Opus so WhatsApp plays it as a voice note
     function toOgg(inputBuf, ext) {
       return new Promise((resolve, reject) => {
         const inp = `/tmp/tts_${id}_in.${ext}`;
         fs.writeFileSync(inp, inputBuf);
-        execFile('ffmpeg', ['-y', '-i', inp, '-c:a', 'libopus', '-ar', '48000', '-ac', '1', '-b:a', '128k', ogg],
+        execFile(
+          'ffmpeg',
+          ['-y', '-i', inp, '-c:a', 'libopus', '-ar', '48000', '-ac', '1', '-b:a', '64k', ogg],
           { timeout: 20000 },
           (err, _o, se) => {
-            try { fs.unlinkSync(inp); } catch(_) {}
-            if (err) return reject(new Error('ffmpeg: ' + (se||err.message).slice(0,200)));
-            if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 50) return reject(new Error('ffmpeg: empty output'));
+            try { fs.unlinkSync(inp); } catch (_) {}
+            if (err) return reject(new Error('ffmpeg: ' + (se || err.message).slice(0, 200)));
+            if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 50)
+              return reject(new Error('ffmpeg: empty output'));
             resolve(fs.readFileSync(ogg));
           }
         );
       });
     }
 
-    // Provider 1: TikTok TTS via Cloudflare Worker (free, no API key, no binary)
-    async function tiktokTTS() {
+    // Provider 1: Google Translate TTS — unofficial but very reliable, no API key needed
+    function googleTTS(lang) {
+      lang = lang || 'en';
       return new Promise((resolve, reject) => {
-        const body = JSON.stringify({ text, voice: 'en_us_001' });
-        const req = https.request({
-          hostname: 'tiktok-tts.weilnet.workers.dev',
-          path: '/api/generation', method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        }, res => {
-          const chunks = [];
-          res.on('data', d => chunks.push(d));
-          res.on('end', () => {
-            try {
-              const j = JSON.parse(Buffer.concat(chunks).toString());
-              if (!j.success || !j.audio) return reject(new Error('TikTok: ' + JSON.stringify(j).slice(0,100)));
-              resolve(Buffer.from(j.audio, 'base64'));
-            } catch(e) { reject(e); }
-          });
-        });
-        req.on('error', reject);
-        req.setTimeout(15000, () => { req.destroy(); reject(new Error('TikTok TTS timeout')); });
-        req.write(body); req.end();
+        const url =
+          `https://translate.google.com/translate_tts` +
+          `?ie=UTF-8&q=${encodeURIComponent(text)}&tl=${lang}&client=tw-ob&ttsspeed=1`;
+        const p = new URL(url);
+        https.get(
+          {
+            hostname: p.hostname,
+            path: p.pathname + p.search,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              Referer: 'https://translate.google.com/',
+            },
+          },
+          res => {
+            if (res.statusCode !== 200)
+              return reject(new Error(`Google TTS: HTTP ${res.statusCode}`));
+            const chunks = [];
+            res.on('data', d => chunks.push(d));
+            res.on('end', () => {
+              const buf = Buffer.concat(chunks);
+              if (buf.length < 512) return reject(new Error('Google TTS: empty response'));
+              resolve(buf);
+            });
+          }
+        ).on('error', reject);
       });
     }
 
-    // Provider 2: espeak-ng/espeak offline binary (works when installed via apt/nix)
-    async function espeakTTS() {
-      const candidates = [
-        '/usr/bin/espeak-ng', '/usr/local/bin/espeak-ng',
-        '/root/.nix-profile/bin/espeak-ng', '/nix/var/nix/profiles/default/bin/espeak-ng',
-        '/usr/bin/espeak', '/usr/local/bin/espeak',
-        '/root/.nix-profile/bin/espeak', '/nix/var/nix/profiles/default/bin/espeak',
-      ];
-      let bin = null;
-      for (const p of candidates) { try { fs.accessSync(p, fs.constants.X_OK); bin = p; break; } catch(_) {} }
-      if (!bin) {
-        bin = await new Promise(r => exec('which espeak-ng 2>/dev/null || which espeak 2>/dev/null', { timeout: 8000 }, (e,o) => r((o||'').trim()||null)));
-      }
-      if (!bin) throw new Error('espeak not found');
-      const wav = `/tmp/tts_${id}.wav`;
-      await new Promise((resolve, reject) => {
-        execFile(bin, ['-v', 'en', '-s', '145', '-p', '50', text, '-w', wav], { timeout: 15000 },
-          (err, _o, se) => err ? reject(new Error((se||err.message).slice(0,200))) : resolve()
-        );
+    // Provider 2: espeak-ng / espeak offline binary
+    function espeakTTS() {
+      return new Promise((resolve, reject) => {
+        const candidates = [
+          '/usr/bin/espeak-ng', '/usr/local/bin/espeak-ng',
+          '/root/.nix-profile/bin/espeak-ng', '/nix/var/nix/profiles/default/bin/espeak-ng',
+          '/usr/bin/espeak', '/usr/local/bin/espeak',
+          '/root/.nix-profile/bin/espeak', '/nix/var/nix/profiles/default/bin/espeak',
+        ];
+        let bin = null;
+        for (const p of candidates) { try { fs.accessSync(p, fs.constants.X_OK); bin = p; break; } catch (_) {} }
+        if (!bin) {
+          exec('which espeak-ng 2>/dev/null || which espeak 2>/dev/null', { timeout: 8000 }, (e, o) => {
+            bin = (o || '').trim() || null;
+            if (!bin) return reject(new Error('espeak not found'));
+            runEspeak(bin, resolve, reject);
+          });
+        } else {
+          runEspeak(bin, resolve, reject);
+        }
       });
-      const wavBuf = fs.readFileSync(wav);
-      try { fs.unlinkSync(wav); } catch(_) {}
-      return wavBuf;
+    }
+
+    function runEspeak(bin, resolve, reject) {
+      const wav = `/tmp/tts_${id}.wav`;
+      execFile(bin, ['-v', 'en', '-s', '145', '-p', '50', text, '-w', wav], { timeout: 15000 }, (err, _o, se) => {
+        if (err) return reject(new Error((se || err.message).slice(0, 200)));
+        const buf = fs.readFileSync(wav);
+        try { fs.unlinkSync(wav); } catch (_) {}
+        resolve(buf);
+      });
     }
 
     try {
       let audioBuf, ext;
-      // Try TikTok TTS first (no binary needed)
-      try { audioBuf = await tiktokTTS(); ext = 'mp3'; }
-      catch(_) {
-        // Fallback to local espeak
+
+      // Try Google Translate TTS first — free, no key, high quality
+      try { audioBuf = await googleTTS('en'); ext = 'mp3'; }
+      catch (_) {
+        // Fallback to local espeak binary
         audioBuf = await espeakTTS(); ext = 'wav';
       }
+
       const oggBuf = await toOgg(audioBuf, ext);
       cleanup();
       await sock.sendMessage(jid, { audio: oggBuf, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: m });
-    } catch(e) {
+    } catch (e) {
       cleanup();
       reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`);
     }
