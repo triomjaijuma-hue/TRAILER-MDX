@@ -136,40 +136,61 @@ module.exports = [
   { name: 'tts', description: 'Text to speech', handler: async ({ sock, jid, m, argText, reply }) => {
     if (!argText) return reply('Usage: .tts <text>');
     const text = String(argText).slice(0, 300);
-    const { execFile } = require('child_process');
+    const { execFile, exec } = require('child_process');
     const fs = require('fs');
+
+    // Find espeak-ng/espeak binary — checks nix store paths since nix-installed
+    // binaries are NOT in the shell PATH that Node.js child processes see
+    let _espeakBin = null;
+    async function getEspeak() {
+      if (_espeakBin) return _espeakBin;
+      const candidates = [
+        '/usr/bin/espeak-ng', '/usr/local/bin/espeak-ng',
+        '/root/.nix-profile/bin/espeak-ng',
+        '/nix/var/nix/profiles/default/bin/espeak-ng',
+        '/home/user/.nix-profile/bin/espeak-ng',
+        '/usr/bin/espeak', '/usr/local/bin/espeak',
+        '/root/.nix-profile/bin/espeak',
+        '/nix/var/nix/profiles/default/bin/espeak',
+      ];
+      for (const p of candidates) {
+        try { fs.accessSync(p, fs.constants.X_OK); return (_espeakBin = p); } catch(_) {}
+      }
+      // Shell PATH fallback
+      const found = await new Promise(r => exec('which espeak-ng 2>/dev/null || which espeak 2>/dev/null', { timeout: 10000 }, (e, o) => r(e ? null : (o||'').trim() || null)));
+      if (found) return (_espeakBin = found);
+      // Deep nix store search (30s)
+      const nix = await new Promise(r => exec('find /nix -name "espeak-ng" -o -name "espeak" 2>/dev/null | grep "bin/espeak" | head -1', { timeout: 30000 }, (e, o) => r(e ? null : (o||'').trim() || null)));
+      if (nix) return (_espeakBin = nix);
+      return null;
+    }
 
     const id  = Date.now();
     const wav = `/tmp/tts_${id}.wav`;
     const ogg = `/tmp/tts_${id}.ogg`;
-
-    function cleanup() {
-      try { fs.unlinkSync(wav); } catch(_) {}
-      try { fs.unlinkSync(ogg); } catch(_) {}
-    }
+    function cleanup() { [wav, ogg].forEach(f => { try { fs.unlinkSync(f); } catch(_) {} }); }
 
     try {
-      // Step 1: espeak-ng → WAV (installed via apt, always in /usr/bin/espeak-ng)
+      const bin = await getEspeak();
+      if (!bin) throw new Error('espeak-ng not found on this server — add espeak-ng to Dockerfile apt-get');
+
+      // Step 1: espeak-ng → WAV
       await new Promise((resolve, reject) => {
-        execFile('espeak-ng', ['-v', 'en', '-s', '145', '-p', '50', text, '-w', wav],
+        execFile(bin, ['-v', 'en', '-s', '145', '-p', '50', text, '-w', wav],
           { timeout: 15000 },
-          (err, _out, stderr) => err ? reject(new Error('espeak-ng: ' + (stderr||err.message).slice(0,200))) : resolve()
+          (err, _o, se) => err ? reject(new Error(bin.split('/').pop() + ': ' + (se||err.message).slice(0,200))) : resolve()
         );
       });
+      if (!fs.existsSync(wav) || fs.statSync(wav).size < 50) throw new Error('espeak produced empty WAV');
 
-      // Verify WAV was created and has content
-      if (!fs.existsSync(wav) || fs.statSync(wav).size < 100) throw new Error('espeak-ng produced empty output');
-
-      // Step 2: WAV → OGG Opus (same pattern as audiofx which works correctly)
+      // Step 2: WAV → OGG Opus (same pattern as audiofx.js which is confirmed working)
       await new Promise((resolve, reject) => {
         execFile('ffmpeg', ['-y', '-i', wav, '-c:a', 'libopus', '-ar', '48000', '-ac', '1', '-b:a', '128k', ogg],
           { timeout: 20000 },
-          (err, _out, stderr) => err ? reject(new Error('ffmpeg: ' + (stderr||err.message).slice(0,200))) : resolve()
+          (err, _o, se) => err ? reject(new Error('ffmpeg: ' + (se||err.message).slice(0,200))) : resolve()
         );
       });
-
-      // Verify OGG was created and has content
-      if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 100) throw new Error('ffmpeg produced empty output');
+      if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 50) throw new Error('ffmpeg produced empty OGG');
 
       const buf = fs.readFileSync(ogg);
       cleanup();
