@@ -137,19 +137,9 @@ function ytdlpAudio(bin, url, strategy, cookiesFile) {
 }
 
 async function downloadAudio(url) {
-  const bin = await getYtdlp();
-  if (!bin) throw new Error('yt-dlp not installed on this server');
-  const cookiesFile = ensureCookies();
   const errs = [];
-  for (const s of STRATEGIES) {
-    try { return { buf: await ytdlpAudio(bin, url, s, cookiesFile), source: `yt-dlp[${s.client}]` }; }
-    catch(e) {
-      errs.push(`${s.client}: ${(e.message || '').slice(0, 100)}`);
-      if (!/(Sign in|bot|403|unplayable|unavailable|PO|nsig|age)/i.test(e.message)) break;
-    }
-  }
 
-  // Fallback: ytdl-core
+  // Primary: ytdl-core (no binary dependency, faster first attempt)
   try {
     let ytdl; try { ytdl = require('@distube/ytdl-core'); } catch(_) { ytdl = require('ytdl-core'); }
     const IOS_UA = 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)';
@@ -167,8 +157,20 @@ async function downloadAudio(url) {
     });
     const buf = Buffer.concat(chunks);
     if (buf.length < 2048) throw new Error('stream empty');
-    return { buf, source: 'ytdl-core' };
-  } catch(e) { errs.push('ytdl-core: ' + e.message?.slice(0, 80)); }
+    return { buf, source: 'ytdl-core', mime: fmt.mimeType?.split(';')[0] || 'audio/mp4' };
+  } catch(e) { errs.push('ytdl-core: ' + (e.message||'').slice(0, 80)); }
+
+  // Secondary: yt-dlp strategies (try ALL — never break early)
+  const bin = await getYtdlp();
+  if (bin) {
+    const cookiesFile = ensureCookies();
+    for (const s of STRATEGIES) {
+      try { return { buf: await ytdlpAudio(bin, url, s, cookiesFile), source: `yt-dlp[${s.client}]`, mime: 'audio/mp4' }; }
+      catch(e) { errs.push(`${s.client}: ${(e.message || '').slice(0, 100)}`); }
+    }
+  } else {
+    errs.push('yt-dlp: not installed');
+  }
 
   // Fallback: Invidious
   const INVIDIOUS = ['https://invidious.nerdvpn.de','https://invidious.fdn.fr','https://yt.artemislena.eu','https://inv.tux.pizza','https://yewtu.be'];
@@ -267,8 +269,8 @@ module.exports = [
       if (!v) return reply('❌ Not found on YouTube.');
       await reply(`🎵 Found: *${v.title}* — downloading audio…`);
       try {
-        const { buf, source } = await downloadAudio(v.url);
-        await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mp4', ptt: false, fileName: `${v.title}.mp3` }, { quoted: m });
+        const { buf, source, mime } = await downloadAudio(v.url);
+        await sock.sendMessage(jid, { audio: buf, mimetype: mime || 'audio/mp4', ptt: false }, { quoted: m });
         await reply(`🎵 *${v.title}*\n${v.author?.name||''} · ${v.timestamp||''}\n_via ${source}_`);
       } catch(e) {
         reply(`❌ Failed: *${v.title}*\n_${e.message?.slice(0, 300)}_`);
