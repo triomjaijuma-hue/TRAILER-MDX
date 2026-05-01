@@ -334,7 +334,29 @@ module.exports = [
       await reply(`🎵 Found: *${v.title}* — downloading audio…`);
       try {
         const { buf, source, mime } = await downloadAudio(v.url);
-        await sock.sendMessage(jid, { audio: buf, mimetype: mime || 'audio/mp4', ptt: false }, { quoted: m });
+        // Convert raw download to standard MP3 — invidious/piped return fragmented
+        // MP4 (DASH/CMAF) or webm which WhatsApp cannot play without conversion
+        let finalBuf = buf;
+        await new Promise((resolve) => {
+          const id = Date.now();
+          const ext = (mime||'').includes('webm') ? 'webm' : 'mp4';
+          const inp = `/tmp/play_${id}.${ext}`;
+          const out = `/tmp/play_${id}.mp3`;
+          fs.writeFileSync(inp, buf);
+          execFile('ffmpeg', ['-y', '-i', inp, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', out],
+            { timeout: 120000, maxBuffer: 80 * 1024 * 1024 },
+            (err) => {
+              try { fs.unlinkSync(inp); } catch(_) {}
+              if (!err) {
+                try { finalBuf = fs.readFileSync(out); fs.unlinkSync(out); } catch(_) {}
+              } else {
+                try { fs.unlinkSync(out); } catch(_) {}
+              }
+              resolve();
+            }
+          );
+        });
+        await sock.sendMessage(jid, { audio: finalBuf, mimetype: 'audio/mpeg', ptt: false }, { quoted: m });
         await reply(`🎵 *${v.title}*\n${v.author?.name||''} · ${v.timestamp||''}\n_via ${source}_`);
       } catch(e) {
         reply(`❌ Failed: *${v.title}*\n_${e.message?.slice(0, 300)}_`);
