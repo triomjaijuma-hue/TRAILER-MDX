@@ -133,22 +133,32 @@ module.exports = [
     } catch (_) {}
     reply('Translate failed — all providers unreachable. Try again in a moment.');
   } },
-  { name: 'tts', description: 'Text to speech (Google translate TTS)', handler: async ({ sock, jid, m, argText, reply }) => {
+  { name: 'tts', description: 'Text to speech', handler: async ({ sock, jid, m, argText, reply }) => {
     if (!argText) return reply('Usage: .tts <text>');
-    const chunks = String(argText).match(/[^.!?\n]{1,180}[.!?\n]?/g) || [argText.slice(0, 180)];
+    const text = String(argText).slice(0, 300);
+    const axios = require('axios');
+    const tryTTS = async (url, headers = {}) => {
+      const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0', ...headers } });
+      const buf = Buffer.from(r.data);
+      if (buf.length < 512) throw new Error('empty audio response');
+      return buf;
+    };
     try {
-      const buffers = [];
-      for (const chunk of chunks.slice(0, 6)) {
-        const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(chunk.trim())}&tl=en&client=tw-ob&ttsspeed=1`;
-        const buf = await require('axios').get(url, {
-          responseType: 'arraybuffer', timeout: 20000,
-          headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://translate.google.com/' },
-        }).then(r => Buffer.from(r.data));
-        buffers.push(buf);
+      // Primary: StreamElements TTS (Brian voice — free, no auth, server-friendly)
+      let buf;
+      try {
+        buf = await tryTTS(`https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=${encodeURIComponent(text)}`);
+      } catch (_) {
+        // Fallback: TikTok TTS proxy (POST)
+        const r2 = await axios.post('https://tiktok-tts.weilnet.workers.dev/api/generation',
+          { text, voice: 'en_us_001' },
+          { responseType: 'arraybuffer', timeout: 20000, headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' } }
+        );
+        buf = Buffer.from(r2.data);
+        if (buf.length < 512) throw new Error('TTS response empty');
       }
-      const out = Buffer.concat(buffers);
-      await sock.sendMessage(jid, { audio: out, mimetype: 'audio/mpeg', ptt: true }, { quoted: m });
-    } catch (e) { reply(`TTS failed: ${e?.message}`); }
+      await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mpeg', ptt: true }, { quoted: m });
+    } catch (e) { reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`); }
   } },
   { name: 'vnote', description: 'Convert quoted audio to voice note', handler: async ({ sock, jid, m, reply }) => {
     const buf = await getQuotedMediaBuffer(m);
