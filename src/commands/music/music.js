@@ -11,8 +11,12 @@ const MAX_MEDIA_BYTES = 50 * 1024 * 1024; // 50 MB — WhatsApp hard limit
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // --- yt-dlp --------------------------------------------------------------
+// Include absolute paths so Railway/Docker finds the binary even if PATH is limited.
 const _BIN_PATHS = [
   process.env.YTDLP_BIN,
+  '/usr/local/bin/yt-dlp',  // Dockerfile installs here
+  '/usr/bin/yt-dlp',
+  '/nix/var/nix/profiles/default/bin/yt-dlp', // nixpacks
   path.join(__dirname, '../../../bin/yt-dlp'),
   'yt-dlp',
 ].filter(Boolean);
@@ -35,7 +39,16 @@ function probeYtdlp() {
   });
 }
 
-function ytdlpDownload(url, kind) {
+// Try the most bot-detection-resistant player clients in order.
+// iOS client does NOT require a PO-token even on cloud IPs.
+const YT_PLAYER_CLIENTS = [
+  'ios,web_embedded',
+  'ios',
+  'tv_embedded',
+  'web_embedded,web',
+];
+
+function ytdlpDownload(url, kind, clientStr) {
   return new Promise((resolve, reject) => {
     helpers.ensureTmp();
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -44,16 +57,23 @@ function ytdlpDownload(url, kind) {
     const fmt = kind === 'audio'
       ? 'bestaudio[ext=m4a]/bestaudio/best'
       : 'best[ext=mp4][height<=480]/best[height<=480]/best[ext=mp4]/best';
+
+    // Use a cookies file if present (export from browser with "Get cookies.txt LOCALLY").
+    // Place the file at the root of your project as cookies.txt.
+    const cookiesPath = path.join(__dirname, '../../../cookies.txt');
+    const cookiesArgs = fs.existsSync(cookiesPath) ? ['--cookies', cookiesPath] : [];
+
     const args = [
       '-f', fmt,
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificate',
-      '--extractor-args', 'youtube:player_client=web_embedded,web',
+      '--extractor-args', `youtube:player_client=${clientStr}`,
       '--user-agent', UA,
       '--max-filesize', String(MAX_MEDIA_BYTES),
       '--socket-timeout', '30',
-      '--retries', '3',
+      '--retries', '2',
+      ...cookiesArgs,
       '-o', out,
       url,
     ];
@@ -73,109 +93,18 @@ function ytdlpDownload(url, kind) {
   });
 }
 
-// --- Cobalt (cobalt.tools) -----------------------------------------------
-// Cobalt already supports YouTube audio & video extraction.
-// It's used in download.js for social media — we reuse the same approach here.
-const COBALT_BASES = [
-  'https://api.cobalt.tools',
-  'https://cobalt.tools/api/json',
-];
-
-async function cobaltFetch(ytUrl, kind) {
-  const body = kind === 'audio'
-    ? { url: ytUrl, downloadMode: 'audio', audioFormat: 'mp3' }
-    : { url: ytUrl, downloadMode: 'auto', videoQuality: '480' };
-  for (const base of COBALT_BASES) {
-    try {
-      const r = await axios.post(base, body, {
-        timeout: 30000,
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': UA,
-        },
-        validateStatus: () => true,
-      });
-      if (r.status >= 500) continue;
-      const d = r.data;
-      if (!d) continue;
-      if (d?.status === 'error') continue;
-      // v10: { status: 'redirect'|'tunnel', url }  legacy: { status: 'success'|'stream', url, audio }
-      const url = d?.url || d?.audio;
-      if (url && /^https?:\/\//.test(url)) return { directUrl: url, source: 'cobalt' };
-    } catch (_) {}
-  }
-  throw new Error('cobalt: all instances failed');
-}
-
-// --- Free API wrappers (no key needed) -----------------------------------
-// These public community APIs wrap yt-dlp server-side.
-const FREE_AUDIO_APIS = [
-  {
-    name: 'y2api',
-    build: (u) => `https://api.y2api.com/api/convert?url=${encodeURIComponent(u)}&format=mp3`,
-    pick: (d) => d?.download_url || d?.url || d?.link,
-  },
-  {
-    name: 'davidcyril',
-    build: (u) => `https://api.davidcyriltech.xyz/download/ytmp3?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.download_url || d?.audio?.url || d?.url,
-  },
-  {
-    name: 'dreaded',
-    build: (u) => `https://api.dreaded.site/api/ytdl/audio?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.url || d?.url,
-  },
-  {
-    name: 'agatz',
-    build: (u) => `https://api.agatz.xyz/api/ytmp3?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.data?.download || d?.data?.url || d?.url,
-  },
-];
-const FREE_VIDEO_APIS = [
-  {
-    name: 'davidcyril',
-    build: (u) => `https://api.davidcyriltech.xyz/download/ytmp4?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.download_url || d?.video?.url || d?.url,
-  },
-  {
-    name: 'dreaded',
-    build: (u) => `https://api.dreaded.site/api/ytdl/video?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.url || d?.url,
-  },
-  {
-    name: 'agatz',
-    build: (u) => `https://api.agatz.xyz/api/ytmp4?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.data?.download || d?.data?.url || d?.url,
-  },
-];
-
-async function resolveDirectUrl(providers, ytUrl) {
+// Try each player client in turn until one succeeds.
+async function ytdlpDownloadWithFallback(url, kind) {
   const errors = [];
-  for (const p of providers) {
+  for (const client of YT_PLAYER_CLIENTS) {
     try {
-      const cfg = { timeout: 25000, headers: { 'User-Agent': UA, Accept: 'application/json' }, validateStatus: () => true };
-      const r = await axios.get(p.build(ytUrl), cfg);
-      if (r.status >= 400) { errors.push(`${p.name}: HTTP ${r.status}`); continue; }
-      const direct = p.pick(r.data);
-      if (direct && /^https?:\/\//.test(direct)) return { direct, source: p.name };
-      errors.push(`${p.name}: no url in response`);
-    } catch (e) { errors.push(`${p.name}: ${e.message?.slice(0, 60) || 'failed'}`); }
+      const buf = await ytdlpDownload(url, kind, client);
+      return { buf, source: `yt-dlp(${client})` };
+    } catch (e) {
+      errors.push(`client=${client}: ${e.message?.slice(0, 80)}`);
+    }
   }
-  throw new Error(errors.join(' | ') || 'no provider responded');
-}
-
-async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
-  const r = await axios.get(url, {
-    responseType: 'arraybuffer',
-    timeout: 120000,
-    maxContentLength: cap,
-    maxBodyLength: cap,
-    headers: { 'User-Agent': UA },
-  });
-  const buf = Buffer.from(r.data);
-  if (buf.length < 1024) throw new Error('downloaded payload too small');
-  return buf;
+  throw new Error(errors.join(' | '));
 }
 
 // --- @distube/ytdl-core --------------------------------------------------
@@ -190,9 +119,14 @@ function getYtdl() {
 async function ytdlCoreDownload(url, kind) {
   const ytdl = getYtdl();
   if (!ytdl) throw new Error('ytdl-core not available');
-  const info = await ytdl.getInfo(url, {
-    requestOptions: { headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' } },
-  });
+  const agent = ytdl.createAgent ? ytdl.createAgent() : undefined;
+  const opts = {
+    requestOptions: {
+      headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' },
+    },
+    ...(agent ? { agent } : {}),
+  };
+  const info = await ytdl.getInfo(url, opts);
   let format;
   if (kind === 'audio') {
     format = info.formats
@@ -221,13 +155,18 @@ async function ytdlCoreDownload(url, kind) {
 
 // --- Invidious -----------------------------------------------------------
 const INVIDIOUS_INSTANCES = [
+  'https://invidious.nerdvpn.de',
+  'https://invidious.fdn.fr',
+  'https://yt.artemislena.eu',
+  'https://invidious.lunar.icu',
+  'https://inv.tux.pizza',
+  'https://invidious.io',
+  'https://yewtu.be',
+  'https://vid.puffyan.us',
+  'https://invidious.snopyta.org',
   'https://inv.nadeko.net',
   'https://invidious.privacydev.net',
-  'https://yt.artemislena.eu',
-  'https://invidious.nerdvpn.de',
   'https://iv.ggtyler.dev',
-  'https://invidious.lunar.icu',
-  'https://invidious.fdn.fr',
 ];
 
 function videoIdFromUrl(url) {
@@ -242,7 +181,7 @@ async function invidiosFetch(ytUrl, kind) {
     try {
       const data = await helpers.getJson(
         `${base}/api/v1/videos/${videoId}?fields=formatStreams,adaptiveFormats`,
-        { timeout: 14000, headers: { 'User-Agent': UA } },
+        { timeout: 10000, headers: { 'User-Agent': UA } },
       );
       if (kind === 'video') {
         const streams = (data?.formatStreams || []).filter(f => f.type?.includes('video/mp4'));
@@ -250,12 +189,12 @@ async function invidiosFetch(ytUrl, kind) {
                   || streams.find(f => (f.quality || '').includes('360'))
                   || streams.find(f => (f.quality || '').includes('720'))
                   || streams[0];
-        if (pick?.url) return { directUrl: pick.url, source: 'invidious' };
+        if (pick?.url) return { directUrl: pick.url, source: `invidious(${base.replace('https://', '')})` };
       } else {
         const adaptives = data?.adaptiveFormats || [];
         const pick = adaptives.find(f => f.type?.includes('audio/mp4'))
                   || adaptives.find(f => f.audioSampleRate);
-        if (pick?.url) return { directUrl: pick.url, source: 'invidious' };
+        if (pick?.url) return { directUrl: pick.url, source: `invidious(${base.replace('https://', '')})` };
       }
     } catch (_) {}
   }
@@ -269,6 +208,9 @@ const PIPED_STREAM_INSTANCES = [
   'https://piped-api.garudalinux.org',
   'https://pipedapi.r4fo.com',
   'https://piped.video/api',
+  'https://piped.smnz.de/api',
+  'https://piped.in.projectsegfau.lt/api',
+  'https://watchapi.whatever.social',
 ];
 
 async function pipedFetch(ytUrl, kind) {
@@ -278,12 +220,12 @@ async function pipedFetch(ytUrl, kind) {
     try {
       const data = await helpers.getJson(
         `${base}/streams/${videoId}`,
-        { timeout: 14000, headers: { 'User-Agent': UA } },
+        { timeout: 10000, headers: { 'User-Agent': UA } },
       );
       if (kind === 'audio') {
         const streams = (data?.audioStreams || []).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
         const pick = streams[0];
-        if (pick?.url) return { directUrl: pick.url, source: 'piped' };
+        if (pick?.url) return { directUrl: pick.url, source: `piped(${base.replace('https://', '')})` };
       } else {
         const streams = (data?.videoStreams || [])
           .filter(s => s.mimeType?.includes('mp4'))
@@ -292,54 +234,58 @@ async function pipedFetch(ytUrl, kind) {
                   || streams.find(s => !s.videoOnly)
                   || streams.find(s => (s.height || 0) <= 480)
                   || streams[0];
-        if (pick?.url) return { directUrl: pick.url, source: 'piped' };
+        if (pick?.url) return { directUrl: pick.url, source: `piped(${base.replace('https://', '')})` };
       }
     } catch (_) {}
   }
   throw new Error('all piped instances failed');
 }
 
+async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
+  const r = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 120000,
+    maxContentLength: cap,
+    maxBodyLength: cap,
+    headers: { 'User-Agent': UA },
+  });
+  const buf = Buffer.from(r.data);
+  if (buf.length < 1024) throw new Error('downloaded payload too small');
+  return buf;
+}
+
 // --- Main download chain -------------------------------------------------
-// Order: yt-dlp → Cobalt → Invidious → Piped → ytdl-core → free API wrappers
+// Order: yt-dlp (ios client) → Invidious → Piped → ytdl-core
+// NOTE: All public wrapper APIs (Cobalt, agatz, dreaded, davidcyril) are
+// dead or Cloudflare-protected in 2026. Only yt-dlp and direct stream APIs work.
 async function fetchYouTubeMedia(url, kind) {
   const errors = [];
 
-  // 1. yt-dlp — most reliable when installed; uses web_embedded player bypass.
+  // 1. yt-dlp with iOS player client — most reliable even on cloud IPs.
+  //    iOS client bypasses the PO-token requirement that blocks cloud servers.
   if (await probeYtdlp()) {
-    try { return { buf: await ytdlpDownload(url, kind), source: 'yt-dlp' }; }
-    catch (e) { errors.push(`yt-dlp: ${e.message?.slice(0, 150)}`); }
+    try {
+      return await ytdlpDownloadWithFallback(url, kind);
+    } catch (e) { errors.push(`yt-dlp: ${e.message?.slice(0, 200)}`); }
   } else {
-    errors.push('yt-dlp: not in PATH');
+    errors.push('yt-dlp: not found at /usr/local/bin/yt-dlp, /usr/bin/yt-dlp, or in PATH — set YTDLP_BIN env var');
   }
 
-  // 2. Cobalt — free YouTube downloader, works on most server IPs.
-  try {
-    const { directUrl, source } = await cobaltFetch(url, kind);
-    return { buf: await downloadCapped(directUrl), source };
-  } catch (e) { errors.push(`cobalt: ${e.message?.slice(0, 100)}`); }
-
-  // 3. Invidious public instances
+  // 2. Invidious public instances (direct YouTube stream URLs)
   try {
     const { directUrl, source } = await invidiosFetch(url, kind);
     return { buf: await downloadCapped(directUrl), source };
   } catch (e) { errors.push(`invidious: ${e.message?.slice(0, 100)}`); }
 
-  // 4. Piped public instances
+  // 3. Piped public instances
   try {
     const { directUrl, source } = await pipedFetch(url, kind);
     return { buf: await downloadCapped(directUrl), source };
   } catch (e) { errors.push(`piped: ${e.message?.slice(0, 100)}`); }
 
-  // 5. ytdl-core (often blocked on cloud IPs but worth trying)
+  // 4. ytdl-core (last resort — often blocked on cloud IPs but worth trying)
   try { return { buf: await ytdlCoreDownload(url, kind), source: 'ytdl-core' }; }
   catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 100)}`); }
-
-  // 6. Free community wrapper APIs
-  const providers = kind === 'audio' ? FREE_AUDIO_APIS : FREE_VIDEO_APIS;
-  try {
-    const { direct, source } = await resolveDirectUrl(providers, url);
-    return { buf: await downloadCapped(direct), source };
-  } catch (e) { errors.push(e.message); }
 
   throw new Error(errors.join(' | '));
 }
@@ -515,7 +461,12 @@ module.exports = [
         }, { quoted: m });
         await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || v.duration?.timestamp || ''}\n_via ${source}_`);
       } catch (e) {
-        reply(`❌ Could not download *${v.title}*\n_All sources failed. Try again in a moment._\n\n_Error: ${e.message?.slice(0, 150)}_`);
+        reply(
+          `❌ Download failed for *${v.title}*\n` +
+          `_${e.message?.slice(0, 200)}_\n\n` +
+          `*Fix:* Set the env var *YTDLP_BIN=/usr/local/bin/yt-dlp* in Railway, then redeploy.\n` +
+          `Or add a *cookies.txt* file (exported from your browser) to the root of the project.`
+        );
       }
     },
   },
@@ -537,7 +488,12 @@ module.exports = [
           caption: `🎬 *${v.title}*\n_via ${source}_`,
         }, { quoted: m });
       } catch (e) {
-        reply(`❌ Could not download *${v.title}*\n_All sources failed. Try again in a moment._\n\n_Error: ${e.message?.slice(0, 150)}_\n\n_Try *.play ${argText}* for audio instead._`);
+        reply(
+          `❌ Download failed for *${v.title}*\n` +
+          `_${e.message?.slice(0, 200)}_\n\n` +
+          `*Fix:* Set the env var *YTDLP_BIN=/usr/local/bin/yt-dlp* in Railway, then redeploy.\n` +
+          `Or try *.play ${argText}* for audio.`
+        );
       }
     },
   },
