@@ -94,97 +94,140 @@ function getYtdlp() {
   }
   return _ytdlpReady;
 }
-getYtdlp(); // warm up immediately on startup
+getYtdlp(); // warm up immediately on startup (still used by .ytdlpcheck command)
 
 // ---------------------------------------------------------------------------
-// yt-dlp audio download — tries multiple clients with matching user-agents
+// Cobalt API — free, handles YouTube nsig/bot-check, no binary needed
 // ---------------------------------------------------------------------------
-const STRATEGIES = [
-  { client: 'ios',          ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
-  { client: 'ios,web_embedded', ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
-  { client: 'tv_embedded',  ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1' },
-  { client: 'web_embedded', ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+const COBALT_INSTANCES = [
+  'https://api.cobalt.tools',
+  'https://cobalt.catvibers.me',
+  'https://co.wuk.sh',
 ];
 
-function ytdlpAudio(bin, url, strategy, cookiesFile) {
+async function cobaltDownload(videoUrl) {
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const res = await new Promise((resolve, reject) => {
+        const body = JSON.stringify({ url: videoUrl, downloadMode: 'audio', audioFormat: 'mp3', filenameStyle: 'basic' });
+        const p = new URL(base);
+        const req = require('https').request({
+          hostname: p.hostname, path: '/', method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0', 'Content-Length': Buffer.byteLength(body) },
+        }, resp => {
+          const chunks = []; resp.on('data', c => chunks.push(c));
+          resp.on('end', () => resolve({ status: resp.statusCode, body: Buffer.concat(chunks).toString() }));
+        });
+        req.on('error', reject); req.setTimeout(20000, () => { req.destroy(new Error('cobalt timeout')); });
+        req.write(body); req.end();
+      });
+      if (res.status !== 200) continue;
+      const data = JSON.parse(res.body);
+      // status can be "tunnel", "redirect", "stream" — all have a .url to download
+      if (!['tunnel','redirect','stream'].includes(data.status) || !data.url) continue;
+      const dl = await httpsGet(data.url);
+      if (dl.status === 200 && dl.body.length > 2048) {
+        return { buf: dl.body, source: `cobalt(${base.replace('https://','')})`, mime: 'audio/mpeg' };
+      }
+    } catch(_) {}
+  }
+  throw new Error('all cobalt instances failed');
+}
+
+// ---------------------------------------------------------------------------
+// yt-dlp via shell exec — uses PATH, works in nix/Railway environments
+// where execFile with hardcoded paths won't find the nix-installed binary
+// ---------------------------------------------------------------------------
+const YT_CLIENTS = [
+  { client: 'ios',         ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
+  { client: 'tv_embedded', ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1' },
+  { client: 'web',         ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+];
+
+function ytdlpShell(videoUrl, client, ua, cookiesFile) {
   return new Promise((resolve, reject) => {
     helpers.ensureTmp();
     const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const out = path.join(config.paths.tmp, `yt_${id}.m4a`);
-    const cookArgs = cookiesFile ? ['--cookies', cookiesFile] : [];
-    const args = [
-      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-      '--no-playlist', '--no-warnings', '--no-check-certificate',
-      '--extractor-args', `youtube:player_client=${strategy.client}`,
-      '--user-agent', strategy.ua,
-      '--max-filesize', String(MAX_DL),
-      '--socket-timeout', '45', '--retries', '2',
-      ...cookArgs, '-o', out, url,
-    ];
-    execFile(bin, args, { timeout: 240000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
+    const cookPart = cookiesFile ? `--cookies "${cookiesFile}"` : '';
+    // Use exec (shell) instead of execFile so nix/PATH-installed yt-dlp is found
+    const cmd = [
+      'yt-dlp',
+      `-f "bestaudio[ext=m4a]/bestaudio/best"`,
+      `--no-playlist --no-warnings --no-check-certificate`,
+      `--extractor-args "youtube:player_client=${client}"`,
+      `--user-agent "${ua}"`,
+      `--max-filesize 75m --socket-timeout 45 --retries 2`,
+      cookPart,
+      `-o "${out}"`,
+      `"${videoUrl}"`,
+    ].filter(Boolean).join(' ');
+    exec(cmd, { timeout: 240000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
       if (err) {
         try { fs.unlinkSync(out); } catch(_) {}
-        const msg = (se || err.message || '').toString().split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 300);
+        const msg = (se || err.message || '').split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 250);
         return reject(new Error(msg || err.message));
       }
       try {
         const buf = fs.readFileSync(out); fs.unlinkSync(out);
         if (buf.length < 2048) return reject(new Error('output too small'));
-        resolve(buf);
+        resolve({ buf, source: `yt-dlp[${client}]`, mime: 'audio/mp4' });
       } catch(e) { reject(e); }
     });
   });
 }
 
+// Check if yt-dlp is available in the shell PATH (cached)
+let _ytdlpInPath = null;
+function checkYtdlpInPath() {
+  if (_ytdlpInPath === null) {
+    _ytdlpInPath = new Promise(r => {
+      exec('yt-dlp --version', { timeout: 12000 }, e => r(!e));
+    });
+  }
+  return _ytdlpInPath;
+}
+checkYtdlpInPath(); // warm up at startup
+
 async function downloadAudio(url) {
   const errs = [];
 
-  // Primary: ytdl-core (no binary dependency, faster first attempt)
+  // Strategy 1: Cobalt API (no binary, handles YouTube nsig properly)
   try {
-    let ytdl; try { ytdl = require('@distube/ytdl-core'); } catch(_) { ytdl = require('ytdl-core'); }
-    const IOS_UA = 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)';
-    const agent  = ytdl.createAgent ? ytdl.createAgent() : undefined;
-    const info   = await ytdl.getInfo(url, { requestOptions: { headers: { 'User-Agent': IOS_UA } }, ...(agent?{agent}:{}) });
-    const fmt    = info.formats.filter(f => f.hasAudio && !f.hasVideo).sort((a,b) => (b.audioBitrate||0)-(a.audioBitrate||0))[0]
-                || ytdl.chooseFormat(info.formats, { quality: 'highestaudio', filter: 'audioonly' });
-    if (!fmt?.url) throw new Error('no format');
-    const chunks = [];
-    await new Promise((res, rej) => {
-      https.get(fmt.url, { headers: { 'User-Agent': IOS_UA } }, resp => {
-        if (resp.statusCode !== 200) return rej(new Error('HTTP ' + resp.statusCode));
-        resp.on('data', c => chunks.push(c)); resp.on('end', res);
-      }).on('error', rej).setTimeout(90000, function() { this.destroy(new Error('timeout')); });
-    });
-    const buf = Buffer.concat(chunks);
-    if (buf.length < 2048) throw new Error('stream empty');
-    return { buf, source: 'ytdl-core', mime: fmt.mimeType?.split(';')[0] || 'audio/mp4' };
-  } catch(e) { errs.push('ytdl-core: ' + (e.message||'').slice(0, 80)); }
+    return await cobaltDownload(url);
+  } catch(e) { errs.push('cobalt: ' + (e.message||'').slice(0, 100)); }
 
-  // Secondary: yt-dlp strategies (try ALL — never break early)
-  const bin = await getYtdlp();
-  if (bin) {
+  // Strategy 2: yt-dlp via shell PATH (works in nixpacks/Railway, Docker)
+  const hasYtdlp = await checkYtdlpInPath();
+  if (hasYtdlp) {
     const cookiesFile = ensureCookies();
-    for (const s of STRATEGIES) {
-      try { return { buf: await ytdlpAudio(bin, url, s, cookiesFile), source: `yt-dlp[${s.client}]`, mime: 'audio/mp4' }; }
-      catch(e) { errs.push(`${s.client}: ${(e.message || '').slice(0, 100)}`); }
+    for (const { client, ua } of YT_CLIENTS) {
+      try { return await ytdlpShell(url, client, ua, cookiesFile); }
+      catch(e) { errs.push(`yt-dlp[${client}]: ${(e.message||'').slice(0, 100)}`); }
     }
   } else {
-    errs.push('yt-dlp: not installed');
+    errs.push('yt-dlp: not found in PATH');
   }
 
-  // Fallback: Invidious
-  const INVIDIOUS = ['https://invidious.nerdvpn.de','https://invidious.fdn.fr','https://yt.artemislena.eu','https://inv.tux.pizza','https://yewtu.be'];
-  const id = url.match(/[?&]v=([A-Za-z0-9_-]{11})/)?.[1];
-  if (id) {
+  // Strategy 3: Invidious public instances (updated list)
+  const INVIDIOUS = [
+    'https://inv.nadeko.net',
+    'https://invidious.privacyredirect.com',
+    'https://iv.ggtyler.dev',
+    'https://invidious.fdn.fr',
+    'https://yewtu.be',
+  ];
+  const vid = url.match(/[?&]v=([A-Za-z0-9_-]{11})/)?.[1];
+  if (vid) {
     for (const base of INVIDIOUS) {
       try {
-        const r = await httpsGet(`${base}/api/v1/videos/${id}?fields=adaptiveFormats`);
+        const r = await httpsGet(`${base}/api/v1/videos/${vid}?fields=adaptiveFormats`);
         if (r.status !== 200) continue;
         const d = JSON.parse(r.body.toString());
         const streamUrl = (d.adaptiveFormats||[]).find(f => f.type?.includes('audio/mp4'))?.url;
         if (!streamUrl) continue;
         const dl = await httpsGet(streamUrl);
-        if (dl.status === 200 && dl.body.length > 2048) return { buf: dl.body, source: 'invidious' };
+        if (dl.status === 200 && dl.body.length > 2048) return { buf: dl.body, source: 'invidious', mime: 'audio/mp4' };
       } catch(_) {}
     }
     errs.push('invidious: all instances failed');
