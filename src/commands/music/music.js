@@ -1,54 +1,82 @@
 'use strict';
 const yts = require('yt-search');
 const axios = require('axios');
-const { execFile } = require('child_process');
+const { execFile, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const helpers = require('../../lib/helpers');
 const config = require('../../lib/config');
 
-const MAX_MEDIA_BYTES = 50 * 1024 * 1024; // 50 MB — WhatsApp hard limit
+const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// --- yt-dlp --------------------------------------------------------------
-// Include absolute paths so Railway/Docker finds the binary even if PATH is limited.
-const _BIN_PATHS = [
-  process.env.YTDLP_BIN,
-  '/usr/local/bin/yt-dlp',  // Dockerfile installs here
-  '/usr/bin/yt-dlp',
-  '/nix/var/nix/profiles/default/bin/yt-dlp', // nixpacks
-  path.join(__dirname, '../../../bin/yt-dlp'),
-  'yt-dlp',
-].filter(Boolean);
+// --- yt-dlp discovery ----------------------------------------------------
+// Searches every possible location: env var, known paths, `which`, and the
+// entire /nix/store (covers Railway nixpacks builds where the binary lands
+// somewhere like /nix/store/<hash>-yt-dlp-<ver>/bin/yt-dlp).
 
 let ytdlpBin = null;
-let ytdlpAvailable = null;
-function probeYtdlp() {
-  if (ytdlpAvailable !== null) return Promise.resolve(ytdlpAvailable);
+let ytdlpSearched = false;
+
+function shellFind(cmd) {
   return new Promise((resolve) => {
-    let tried = 0;
-    const tryNext = () => {
-      if (tried >= _BIN_PATHS.length) { ytdlpAvailable = false; return resolve(false); }
-      const bin = _BIN_PATHS[tried++];
-      execFile(bin, ['--version'], { timeout: 5000 }, (err) => {
-        if (!err) { ytdlpBin = bin; ytdlpAvailable = true; return resolve(true); }
-        tryNext();
-      });
-    };
-    tryNext();
+    exec(cmd, { timeout: 8000 }, (err, stdout) => {
+      resolve(err ? '' : (stdout || '').trim().split('\n')[0].trim());
+    });
   });
 }
 
-// Try the most bot-detection-resistant player clients in order.
-// iOS client does NOT require a PO-token even on cloud IPs.
+function testBin(bin) {
+  return new Promise((resolve) => {
+    if (!bin) return resolve(false);
+    execFile(bin, ['--version'], { timeout: 5000 }, (err) => resolve(!err));
+  });
+}
+
+async function findYtdlp() {
+  if (ytdlpSearched) return ytdlpBin;
+  ytdlpSearched = true;
+
+  const candidates = [
+    process.env.YTDLP_BIN,
+    '/usr/local/bin/yt-dlp',
+    '/usr/bin/yt-dlp',
+    '/bin/yt-dlp',
+    path.join(__dirname, '../../../bin/yt-dlp'),
+  ].filter(Boolean);
+
+  // Try known paths first (fast)
+  for (const p of candidates) {
+    if (await testBin(p)) { ytdlpBin = p; return p; }
+  }
+
+  // Use shell `which` / `command -v` (catches PATH entries)
+  const fromWhich = await shellFind('which yt-dlp 2>/dev/null || command -v yt-dlp 2>/dev/null');
+  if (fromWhich && await testBin(fromWhich)) { ytdlpBin = fromWhich; return fromWhich; }
+
+  // Scan /nix/store — covers Railway nixpacks where the path is a hash
+  const fromNix = await shellFind('find /nix -name yt-dlp -type f 2>/dev/null | head -1');
+  if (fromNix && await testBin(fromNix)) { ytdlpBin = fromNix; return fromNix; }
+
+  // Scan /run (some nix profiles)
+  const fromRun = await shellFind('find /run -name yt-dlp -type f 2>/dev/null | head -1');
+  if (fromRun && await testBin(fromRun)) { ytdlpBin = fromRun; return fromRun; }
+
+  return null;
+}
+
+// --- yt-dlp download -----------------------------------------------------
+// Tries multiple YouTube player clients in order.
+// The iOS client bypasses PO-token bot detection without cookies.
 const YT_PLAYER_CLIENTS = [
   'ios,web_embedded',
   'ios',
   'tv_embedded',
   'web_embedded,web',
+  'web',
 ];
 
-function ytdlpDownload(url, kind, clientStr) {
+function ytdlpDownload(bin, url, kind, clientStr) {
   return new Promise((resolve, reject) => {
     helpers.ensureTmp();
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -58,50 +86,47 @@ function ytdlpDownload(url, kind, clientStr) {
       ? 'bestaudio[ext=m4a]/bestaudio/best'
       : 'best[ext=mp4][height<=480]/best[height<=480]/best[ext=mp4]/best';
 
-    // Use a cookies file if present (export from browser with "Get cookies.txt LOCALLY").
-    // Place the file at the root of your project as cookies.txt.
     const cookiesPath = path.join(__dirname, '../../../cookies.txt');
     const cookiesArgs = fs.existsSync(cookiesPath) ? ['--cookies', cookiesPath] : [];
 
     const args = [
       '-f', fmt,
-      '--no-playlist',
-      '--no-warnings',
-      '--no-check-certificate',
+      '--no-playlist', '--no-warnings', '--no-check-certificate',
       '--extractor-args', `youtube:player_client=${clientStr}`,
       '--user-agent', UA,
       '--max-filesize', String(MAX_MEDIA_BYTES),
       '--socket-timeout', '30',
       '--retries', '2',
       ...cookiesArgs,
-      '-o', out,
-      url,
+      '-o', out, url,
     ];
-    execFile(ytdlpBin || 'yt-dlp', args, { timeout: 180000, maxBuffer: 64 * 1024 * 1024 }, (err, _so, se) => {
+
+    execFile(bin, args, { timeout: 180000, maxBuffer: 64 * 1024 * 1024 }, (err, _so, se) => {
       if (err) {
         try { fs.unlinkSync(out); } catch (_) {}
-        const msg = (se || err.message || '').toString().split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 300);
+        const msg = (se || err.message || '').toString().split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 250);
         return reject(new Error(msg || 'yt-dlp failed'));
       }
       try {
         const buf = fs.readFileSync(out);
         fs.unlinkSync(out);
-        if (buf.length < 2048) return reject(new Error('yt-dlp output too small'));
+        if (buf.length < 2048) return reject(new Error('output file too small'));
         resolve(buf);
       } catch (e) { reject(e); }
     });
   });
 }
 
-// Try each player client in turn until one succeeds.
-async function ytdlpDownloadWithFallback(url, kind) {
+async function ytdlpDownloadWithFallback(bin, url, kind) {
   const errors = [];
   for (const client of YT_PLAYER_CLIENTS) {
     try {
-      const buf = await ytdlpDownload(url, kind, client);
+      const buf = await ytdlpDownload(bin, url, kind, client);
       return { buf, source: `yt-dlp(${client})` };
     } catch (e) {
-      errors.push(`client=${client}: ${e.message?.slice(0, 80)}`);
+      errors.push(`${client}: ${e.message?.slice(0, 80)}`);
+      // If it's not a bot-detection error, no point retrying other clients
+      if (!e.message?.includes('Sign in') && !e.message?.includes('bot') && !e.message?.includes('403')) break;
     }
   }
   throw new Error(errors.join(' | '));
@@ -120,13 +145,10 @@ async function ytdlCoreDownload(url, kind) {
   const ytdl = getYtdl();
   if (!ytdl) throw new Error('ytdl-core not available');
   const agent = ytdl.createAgent ? ytdl.createAgent() : undefined;
-  const opts = {
-    requestOptions: {
-      headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' },
-    },
+  const info = await ytdl.getInfo(url, {
+    requestOptions: { headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' } },
     ...(agent ? { agent } : {}),
-  };
-  const info = await ytdl.getInfo(url, opts);
+  });
   let format;
   if (kind === 'audio') {
     format = info.formats
@@ -140,16 +162,14 @@ async function ytdlCoreDownload(url, kind) {
     if (!format) format = ytdl.chooseFormat(info.formats, { quality: '480p', filter: 'videoandaudio' });
     if (!format) format = ytdl.chooseFormat(info.formats, { filter: 'videoandaudio' });
   }
-  if (!format?.url) throw new Error('no suitable ytdl-core format');
+  if (!format?.url) throw new Error('no suitable format');
   const r = await axios.get(format.url, {
-    responseType: 'arraybuffer',
-    timeout: 90000,
-    maxContentLength: MAX_MEDIA_BYTES,
-    maxBodyLength: MAX_MEDIA_BYTES,
+    responseType: 'arraybuffer', timeout: 90000,
+    maxContentLength: MAX_MEDIA_BYTES, maxBodyLength: MAX_MEDIA_BYTES,
     headers: { 'User-Agent': UA, ...(format.requestHeaders || {}) },
   });
   const buf = Buffer.from(r.data);
-  if (buf.length < 2048) throw new Error('ytdl-core stream too small');
+  if (buf.length < 2048) throw new Error('stream too small');
   return buf;
 }
 
@@ -160,13 +180,10 @@ const INVIDIOUS_INSTANCES = [
   'https://yt.artemislena.eu',
   'https://invidious.lunar.icu',
   'https://inv.tux.pizza',
-  'https://invidious.io',
   'https://yewtu.be',
-  'https://vid.puffyan.us',
-  'https://invidious.snopyta.org',
+  'https://invidious.io',
   'https://inv.nadeko.net',
   'https://invidious.privacydev.net',
-  'https://iv.ggtyler.dev',
 ];
 
 function videoIdFromUrl(url) {
@@ -187,14 +204,13 @@ async function invidiosFetch(ytUrl, kind) {
         const streams = (data?.formatStreams || []).filter(f => f.type?.includes('video/mp4'));
         const pick = streams.find(f => (f.quality || '').includes('480'))
                   || streams.find(f => (f.quality || '').includes('360'))
-                  || streams.find(f => (f.quality || '').includes('720'))
                   || streams[0];
-        if (pick?.url) return { directUrl: pick.url, source: `invidious(${base.replace('https://', '')})` };
+        if (pick?.url) return { directUrl: pick.url, source: `invidious` };
       } else {
         const adaptives = data?.adaptiveFormats || [];
         const pick = adaptives.find(f => f.type?.includes('audio/mp4'))
                   || adaptives.find(f => f.audioSampleRate);
-        if (pick?.url) return { directUrl: pick.url, source: `invidious(${base.replace('https://', '')})` };
+        if (pick?.url) return { directUrl: pick.url, source: `invidious` };
       }
     } catch (_) {}
   }
@@ -210,7 +226,6 @@ const PIPED_STREAM_INSTANCES = [
   'https://piped.video/api',
   'https://piped.smnz.de/api',
   'https://piped.in.projectsegfau.lt/api',
-  'https://watchapi.whatever.social',
 ];
 
 async function pipedFetch(ytUrl, kind) {
@@ -224,17 +239,15 @@ async function pipedFetch(ytUrl, kind) {
       );
       if (kind === 'audio') {
         const streams = (data?.audioStreams || []).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-        const pick = streams[0];
-        if (pick?.url) return { directUrl: pick.url, source: `piped(${base.replace('https://', '')})` };
+        if (streams[0]?.url) return { directUrl: streams[0].url, source: `piped` };
       } else {
         const streams = (data?.videoStreams || [])
           .filter(s => s.mimeType?.includes('mp4'))
           .sort((a, b) => (b.height || 0) - (a.height || 0));
         const pick = streams.find(s => !s.videoOnly && (s.height || 0) <= 480)
                   || streams.find(s => !s.videoOnly)
-                  || streams.find(s => (s.height || 0) <= 480)
                   || streams[0];
-        if (pick?.url) return { directUrl: pick.url, source: `piped(${base.replace('https://', '')})` };
+        if (pick?.url) return { directUrl: pick.url, source: `piped` };
       }
     } catch (_) {}
   }
@@ -243,49 +256,44 @@ async function pipedFetch(ytUrl, kind) {
 
 async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
   const r = await axios.get(url, {
-    responseType: 'arraybuffer',
-    timeout: 120000,
-    maxContentLength: cap,
-    maxBodyLength: cap,
+    responseType: 'arraybuffer', timeout: 120000,
+    maxContentLength: cap, maxBodyLength: cap,
     headers: { 'User-Agent': UA },
   });
   const buf = Buffer.from(r.data);
-  if (buf.length < 1024) throw new Error('downloaded payload too small');
+  if (buf.length < 1024) throw new Error('payload too small');
   return buf;
 }
 
 // --- Main download chain -------------------------------------------------
-// Order: yt-dlp (ios client) → Invidious → Piped → ytdl-core
-// NOTE: All public wrapper APIs (Cobalt, agatz, dreaded, davidcyril) are
-// dead or Cloudflare-protected in 2026. Only yt-dlp and direct stream APIs work.
 async function fetchYouTubeMedia(url, kind) {
   const errors = [];
 
-  // 1. yt-dlp with iOS player client — most reliable even on cloud IPs.
-  //    iOS client bypasses the PO-token requirement that blocks cloud servers.
-  if (await probeYtdlp()) {
+  // 1. yt-dlp — searched dynamically across all known locations including /nix/store
+  const bin = await findYtdlp();
+  if (bin) {
     try {
-      return await ytdlpDownloadWithFallback(url, kind);
-    } catch (e) { errors.push(`yt-dlp: ${e.message?.slice(0, 200)}`); }
+      return await ytdlpDownloadWithFallback(bin, url, kind);
+    } catch (e) { errors.push(`yt-dlp(${bin}): ${e.message?.slice(0, 180)}`); }
   } else {
-    errors.push('yt-dlp: not found at /usr/local/bin/yt-dlp, /usr/bin/yt-dlp, or in PATH — set YTDLP_BIN env var');
+    errors.push('yt-dlp: not found anywhere on this system');
   }
 
-  // 2. Invidious public instances (direct YouTube stream URLs)
+  // 2. Invidious direct stream URLs
   try {
     const { directUrl, source } = await invidiosFetch(url, kind);
     return { buf: await downloadCapped(directUrl), source };
-  } catch (e) { errors.push(`invidious: ${e.message?.slice(0, 100)}`); }
+  } catch (e) { errors.push(`invidious: ${e.message?.slice(0, 80)}`); }
 
-  // 3. Piped public instances
+  // 3. Piped direct stream URLs
   try {
     const { directUrl, source } = await pipedFetch(url, kind);
     return { buf: await downloadCapped(directUrl), source };
-  } catch (e) { errors.push(`piped: ${e.message?.slice(0, 100)}`); }
+  } catch (e) { errors.push(`piped: ${e.message?.slice(0, 80)}`); }
 
-  // 4. ytdl-core (last resort — often blocked on cloud IPs but worth trying)
+  // 4. ytdl-core
   try { return { buf: await ytdlCoreDownload(url, kind), source: 'ytdl-core' }; }
-  catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 100)}`); }
+  catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 80)}`); }
 
   throw new Error(errors.join(' | '));
 }
@@ -307,7 +315,7 @@ async function search(q) {
     if (/official\s+(audio|video|music)/i.test(v.title)) score += 3;
     if (/lyrics?/i.test(v.title)) score += 1;
     if (/\btopic\b|vevo/i.test(v.author?.name || '')) score += 3;
-    if (/reaction|tutorial|cover|how to play|guitar lesson|piano lesson|sped\s*up|nightcore|slowed/i.test(v.title)) score -= 3;
+    if (/reaction|tutorial|cover|sped\s*up|nightcore|slowed/i.test(v.title)) score -= 3;
     if (/mix|playlist|hours?/i.test(v.title)) score -= 1;
     const sec = v.duration?.seconds || 0;
     if (sec >= 45 && sec <= 720) score += 1;
@@ -348,8 +356,7 @@ async function ytSearchScrape(query) {
         title, videoId: v.videoId,
         url: `https://www.youtube.com/watch?v=${v.videoId}`,
         author: { name: v.ownerText?.runs?.[0]?.text || v.longBylineText?.runs?.[0]?.text || '' },
-        duration: { seconds, timestamp: lengthText },
-        timestamp: lengthText,
+        duration: { seconds, timestamp: lengthText }, timestamp: lengthText,
         views: Number((v.viewCountText?.simpleText || '0').replace(/\D/g, '')) || 0,
       });
       if (out.length >= 20) break;
@@ -394,7 +401,7 @@ function secsToStamp(s) {
 async function fetchLyrics(query) {
   const parts = query.split(/\s*-\s*/);
   const artist = parts.length > 1 ? (parts[0] || '').trim() : '';
-  const song   = (parts.length > 1 ? parts.slice(1).join(' - ') : query).trim();
+  const song = (parts.length > 1 ? parts.slice(1).join(' - ') : query).trim();
   try {
     const data = await helpers.getJson(`https://lrclib.net/api/search?q=${encodeURIComponent(query)}`, { timeout: 12000 });
     const hit = Array.isArray(data) ? data.find(x => x.plainLyrics || x.syncedLyrics) : null;
@@ -406,12 +413,6 @@ async function fetchLyrics(query) {
       const data = await helpers.getJson(`https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(song)}`, { timeout: 12000 });
       const text = data?.plainLyrics || stripLrcTimestamps(data?.syncedLyrics);
       if (text) return { text, title: `${data.artistName} — ${data.trackName}` };
-    } catch (_) {}
-  }
-  if (artist && song && artist !== song) {
-    try {
-      const data = await helpers.getJson(`https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(song)}`, { timeout: 12000 });
-      if (data?.lyrics) return { text: data.lyrics, title: `${artist} — ${song}` };
     } catch (_) {}
   }
   try {
@@ -454,19 +455,12 @@ module.exports = [
       try {
         const { buf, source } = await fetchYouTubeMedia(v.url, 'audio');
         await sock.sendMessage(jid, {
-          audio: buf,
-          mimetype: 'audio/mp4',
-          ptt: false,
+          audio: buf, mimetype: 'audio/mp4', ptt: false,
           fileName: `${v.title}.mp3`,
         }, { quoted: m });
-        await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || v.duration?.timestamp || ''}\n_via ${source}_`);
+        await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}\n_via ${source}_`);
       } catch (e) {
-        reply(
-          `❌ Download failed for *${v.title}*\n` +
-          `_${e.message?.slice(0, 200)}_\n\n` +
-          `*Fix:* Set the env var *YTDLP_BIN=/usr/local/bin/yt-dlp* in Railway, then redeploy.\n` +
-          `Or add a *cookies.txt* file (exported from your browser) to the root of the project.`
-        );
+        reply(`❌ Download failed for *${v.title}*\n_${e.message?.slice(0, 300)}_`);
       }
     },
   },
@@ -483,17 +477,23 @@ module.exports = [
       try {
         const { buf, source } = await fetchYouTubeMedia(v.url, 'video');
         await sock.sendMessage(jid, {
-          video: buf,
-          mimetype: 'video/mp4',
+          video: buf, mimetype: 'video/mp4',
           caption: `🎬 *${v.title}*\n_via ${source}_`,
         }, { quoted: m });
       } catch (e) {
-        reply(
-          `❌ Download failed for *${v.title}*\n` +
-          `_${e.message?.slice(0, 200)}_\n\n` +
-          `*Fix:* Set the env var *YTDLP_BIN=/usr/local/bin/yt-dlp* in Railway, then redeploy.\n` +
-          `Or try *.play ${argText}* for audio.`
-        );
+        reply(`❌ Download failed for *${v.title}*\n_${e.message?.slice(0, 300)}_\n\n_Try *.play ${argText}* for audio._`);
+      }
+    },
+  },
+  {
+    name: 'ytdlpcheck', aliases: ['checkytdlp'],
+    description: 'Check if yt-dlp is available on this server',
+    handler: async ({ reply }) => {
+      const bin = await findYtdlp();
+      if (bin) {
+        reply(`✅ yt-dlp found at: \`${bin}\`\nSet *YTDLP_BIN=${bin}* in your Railway env vars for faster startup.`);
+      } else {
+        reply('❌ yt-dlp not found anywhere on this server.\nIt must be installed in the Docker image or nixpacks config.');
       }
     },
   },
@@ -503,11 +503,11 @@ module.exports = [
       if (!argText) return reply('Usage: .lyrics <song>  or  .lyrics <artist> - <song>');
       try {
         const result = await fetchLyrics(argText);
-        if (!result) return reply('No lyrics found. Try `.lyrics <artist> - <song>`.');
+        if (!result) return reply('No lyrics found.');
         const header = result.title ? `🎤 *${result.title}*\n\n` : '';
         const body = result.text.length > 3500 ? result.text.slice(0, 3500) + '\n\n_…truncated_' : result.text;
         reply(header + body);
-      } catch (e) { reply(`Lyrics service unavailable: ${e.message?.slice(0, 120)}`); }
+      } catch (e) { reply(`Lyrics unavailable: ${e.message?.slice(0, 120)}`); }
     },
   },
   {
