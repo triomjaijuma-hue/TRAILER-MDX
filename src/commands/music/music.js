@@ -1,283 +1,73 @@
 'use strict';
-const yts   = require('yt-search');
-const https = require('https');
-const { execFile, exec } = require('child_process');
-const fs    = require('fs');
-const path  = require('path');
+const yts     = require('yt-search');
+const ytdl    = require('@distube/ytdl-core');
+const https   = require('https');
+const { execFile } = require('child_process');
+const fs      = require('fs');
+const path    = require('path');
 const helpers = require('../../lib/helpers');
 const config  = require('../../lib/config');
 
-const MAX_DL = 75 * 1024 * 1024;
-
 // ---------------------------------------------------------------------------
-// Cookies — set YOUTUBE_COOKIES env var in Railway (base64 of cookies.txt)
-// Cookies bypass YouTube's cloud IP block. Without them yt-dlp may fail.
+// YouTube search helpers
 // ---------------------------------------------------------------------------
-const COOKIES_FILE = '/tmp/yt-cookies.txt';
-function ensureCookies() {
-  if (fs.existsSync(COOKIES_FILE)) return COOKIES_FILE;
-  const repoCookies = path.join(__dirname, '../../../cookies.txt');
-  if (fs.existsSync(repoCookies)) { fs.copyFileSync(repoCookies, COOKIES_FILE); return COOKIES_FILE; }
-  const b64 = process.env.YOUTUBE_COOKIES || process.env.YT_COOKIES;
-  if (b64) {
-    try {
-      const decoded = Buffer.from(b64, 'base64').toString('utf8');
-      if (decoded.includes('youtube.com')) { fs.writeFileSync(COOKIES_FILE, decoded); console.log('[music] cookies loaded from env'); return COOKIES_FILE; }
-    } catch(_) {}
-  }
-  return null;
+async function ytSearch(q) {
+  try {
+    const r = await yts(q);
+    if (r?.videos?.length) return r;
+  } catch (_) {}
+  // Scrape fallback
+  try {
+    const r = await ytScrape(q);
+    if (r?.videos?.length) return r;
+  } catch (_) {}
+  return { videos: [] };
 }
-const COOKIES = ensureCookies();
-
-// ---------------------------------------------------------------------------
-// yt-dlp finder + self-installer
-// ---------------------------------------------------------------------------
-const YTDLP_TMP = '/tmp/yt-dlp';
-const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
-
-function testBin(p) { return new Promise(r => { if (!p) return r(false); try { fs.accessSync(p, fs.constants.X_OK); } catch(_) { return r(false); } execFile(p, ['--version'], { timeout: 20000 }, e => r(!e)); }); }
-function sh(cmd, ms) { return new Promise(r => exec(cmd, { timeout: ms||30000 }, (e,o) => r(e?'':(o||'').trim().split('\n')[0]))); }
 
 function httpsGet(url, maxRedir) {
   maxRedir = maxRedir == null ? 8 : maxRedir;
   return new Promise((resolve, reject) => {
     const p = new URL(url);
-    https.get({ hostname: p.hostname, path: p.pathname + p.search, headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
-      if ([301,302,307,308].includes(res.statusCode) && res.headers.location) {
-        return maxRedir > 0 ? resolve(httpsGet(res.headers.location, maxRedir-1)) : reject(new Error('too many redirects'));
-      }
-      const c = []; res.on('data', d => c.push(d)); res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(c) }));
-    }).on('error', reject);
-  });
-}
-
-function dlBin(url, dest) {
-  return new Promise((resolve, reject) => {
-    const p = new URL(url);
-    https.get({ hostname: p.hostname, path: p.pathname + p.search, headers: { 'User-Agent': 'installer/1.0' } }, res => {
-      if ([301,302,307,308].includes(res.statusCode)) return resolve(dlBin(res.headers.location, dest));
-      if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
-      const tmp = dest + '.dl'; const file = fs.createWriteStream(tmp);
-      res.pipe(file);
-      file.on('finish', () => file.close(() => { try { fs.renameSync(tmp, dest); resolve(); } catch(e) { reject(e); } }));
-      file.on('error', e => { try { fs.unlinkSync(tmp); } catch(_) {} reject(e); });
-    }).on('error', reject);
-  });
-}
-
-let _ytdlpReady = null;
-function getYtdlp() {
-  if (!_ytdlpReady) {
-    _ytdlpReady = (async () => {
-      // Fast check: known static paths (Docker /usr/local/bin, nixpkgs profiles)
-      const candidates = [
-        '/usr/local/bin/yt-dlp',
-        process.env.YTDLP_BIN,
-        '/root/.nix-profile/bin/yt-dlp',
-        '/nix/var/nix/profiles/default/bin/yt-dlp',
-        '/home/user/.nix-profile/bin/yt-dlp',
-        path.join(__dirname, '../../../bin/yt-dlp'),
-        '/usr/bin/yt-dlp', '/bin/yt-dlp',
-        YTDLP_TMP,
-      ].filter(Boolean);
-      for (const p of candidates) {
-        try { fs.accessSync(p, fs.constants.X_OK); console.log('[music] yt-dlp at', p); return p; } catch(_) {}
-      }
-      // Shell PATH (nix may expose binary here even if not at a fixed path)
-      const w = await sh('which yt-dlp 2>/dev/null || command -v yt-dlp 2>/dev/null', 15000);
-      if (w) { console.log('[music] yt-dlp via PATH:', w); return w; }
-      // Deep nix store search (60s — nix store can be large)
-      const f = await sh('find /nix /run -name yt-dlp -type f 2>/dev/null | head -1', 60000);
-      if (f) { console.log('[music] yt-dlp in nix store:', f); return f; }
-      // Self-download as last resort
-      console.log('[music] yt-dlp not found — downloading...');
-      try {
-        await dlBin(YTDLP_URL, YTDLP_TMP);
-        fs.chmodSync(YTDLP_TMP, 0o755);
-        if (await testBin(YTDLP_TMP)) { console.log('[music] yt-dlp self-downloaded OK'); return YTDLP_TMP; }
-      } catch(e) { console.error('[music] self-download failed:', e.message); }
-      console.error('[music] yt-dlp unavailable');
-      return null;
-    })();
-  }
-  return _ytdlpReady;
-}
-getYtdlp(); // warm up immediately on startup (still used by .ytdlpcheck command)
-
-// ---------------------------------------------------------------------------
-// Cobalt API — free, handles YouTube nsig/bot-check, no binary needed
-// ---------------------------------------------------------------------------
-const COBALT_INSTANCES = [
-  'https://api.cobalt.tools',
-  'https://cobalt.catvibers.me',
-  'https://co.wuk.sh',
-];
-
-async function cobaltDownload(videoUrl) {
-  for (const base of COBALT_INSTANCES) {
-    try {
-      const res = await new Promise((resolve, reject) => {
-        const body = JSON.stringify({ url: videoUrl, downloadMode: 'audio', audioFormat: 'mp3', filenameStyle: 'basic' });
-        const p = new URL(base);
-        const req = require('https').request({
-          hostname: p.hostname, path: '/', method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0', 'Content-Length': Buffer.byteLength(body) },
-        }, resp => {
-          const chunks = []; resp.on('data', c => chunks.push(c));
-          resp.on('end', () => resolve({ status: resp.statusCode, body: Buffer.concat(chunks).toString() }));
-        });
-        req.on('error', reject); req.setTimeout(20000, () => { req.destroy(new Error('cobalt timeout')); });
-        req.write(body); req.end();
-      });
-      if (res.status !== 200) continue;
-      const data = JSON.parse(res.body);
-      // status can be "tunnel", "redirect", "stream" — all have a .url to download
-      if (!['tunnel','redirect','stream'].includes(data.status) || !data.url) continue;
-      const dl = await httpsGet(data.url);
-      if (dl.status === 200 && dl.body.length > 2048) {
-        return { buf: dl.body, source: `cobalt(${base.replace('https://','')})`, mime: 'audio/mpeg' };
-      }
-    } catch(_) {}
-  }
-  throw new Error('all cobalt instances failed');
-}
-
-// ---------------------------------------------------------------------------
-// yt-dlp download — uses execFile with the actual binary path found by
-// getYtdlp(), which searches nix store, profiles, and standard locations
-// ---------------------------------------------------------------------------
-const YT_CLIENTS = [
-  { client: 'ios',         ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
-  { client: 'tv_embedded', ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1' },
-  { client: 'web',         ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-];
-
-function ytdlpExec(bin, videoUrl, client, ua, cookiesFile) {
-  return new Promise((resolve, reject) => {
-    helpers.ensureTmp();
-    const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    const out = path.join(config.paths.tmp, `yt_${id}.m4a`);
-    const args = [
-      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-      '--no-playlist', '--no-warnings', '--no-check-certificate',
-      '--extractor-args', `youtube:player_client=${client}`,
-      '--user-agent', ua,
-      '--max-filesize', '75m',
-      '--socket-timeout', '45', '--retries', '2',
-      ...(cookiesFile ? ['--cookies', cookiesFile] : []),
-      '-o', out, videoUrl,
-    ];
-    execFile(bin, args, { timeout: 240000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
-      if (err) {
-        try { fs.unlinkSync(out); } catch(_) {}
-        const msg = (se || err.message || '').split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 250);
-        return reject(new Error(msg || err.message));
-      }
-      try {
-        const buf = fs.readFileSync(out); fs.unlinkSync(out);
-        if (buf.length < 2048) return reject(new Error('output too small'));
-        resolve({ buf, source: `yt-dlp[${client}]`, mime: 'audio/mp4' });
-      } catch(e) { reject(e); }
-    });
-  });
-}
-
-async function downloadAudio(url) {
-  const errs = [];
-
-  // Strategy 1: Cobalt API (no binary, handles YouTube nsig properly)
-  try {
-    return await cobaltDownload(url);
-  } catch(e) { errs.push('cobalt: ' + (e.message||'').slice(0, 100)); }
-
-  // Strategy 2: yt-dlp with actual binary path (getYtdlp searches nix store, profiles, etc.)
-  const ytBin = await getYtdlp();
-  if (ytBin) {
-    const cookiesFile = ensureCookies();
-    for (const { client, ua } of YT_CLIENTS) {
-      try { return await ytdlpExec(ytBin, url, client, ua, cookiesFile); }
-      catch(e) { errs.push(`yt-dlp[${client}]: ${(e.message||'').slice(0, 100)}`); }
-    }
-  } else {
-    errs.push('yt-dlp: binary not found');
-  }
-
-  // Strategy 3: Invidious — use /latest_version proxy endpoint so audio is served by
-  // Invidious (not YouTube CDN). Cloud IPs can reach Invidious but not YouTube CDN directly.
-  const INVIDIOUS = [
-    'https://inv.nadeko.net',
-    'https://invidious.privacyredirect.com',
-    'https://iv.ggtyler.dev',
-    'https://yewtu.be',
-    'https://invidious.fdn.fr',
-  ];
-  const vid = url.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1];
-  if (vid) {
-    for (const base of INVIDIOUS) {
-      // itag 140 = audio/mp4 @128kbps proxied through Invidious (&local=true)
-      for (const itag of ['140', '251']) {
-        try {
-          const dl = await httpsGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`);
-          if (dl.status === 200 && dl.body.length > 4096) {
-            return { buf: dl.body, source: 'invidious', mime: itag === '140' ? 'audio/mp4' : 'audio/webm' };
-          }
-        } catch(_) {}
-      }
-    }
-    errs.push('invidious: all instances failed');
-  }
-
-  // Strategy 4: Piped API — another open-source YouTube frontend with proxied audio streams
-  const PIPED = [
-    'https://pipedapi.kavin.rocks',
-    'https://piped-api.garudalinux.org',
-    'https://api.piped.projectsegfau.lt',
-  ];
-  if (vid) {
-    for (const base of PIPED) {
-      try {
-        const r = await httpsGet(`${base}/streams/${vid}`);
-        if (r.status !== 200) continue;
-        const d = JSON.parse(r.body.toString());
-        const streams = (d.audioStreams || []).sort((a, b) => (b.bitrate||0) - (a.bitrate||0));
-        for (const s of streams) {
-          if (!s.url) continue;
-          try {
-            const dl = await httpsGet(s.url);
-            if (dl.status === 200 && dl.body.length > 4096) {
-              return { buf: dl.body, source: 'piped', mime: s.mimeType || 'audio/mp4' };
-            }
-          } catch(_) {}
+    https.get(
+      { hostname: p.hostname, path: p.pathname + p.search, headers: { 'User-Agent': 'Mozilla/5.0' } },
+      res => {
+        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+          return maxRedir > 0
+            ? resolve(httpsGet(res.headers.location, maxRedir - 1))
+            : reject(new Error('too many redirects'));
         }
-      } catch(_) {}
-    }
-    errs.push('piped: all instances failed');
-  }
-
-  throw new Error(errs.join(' | '));
-}
-
-// ---------------------------------------------------------------------------
-// YouTube search
-// ---------------------------------------------------------------------------
-async function ytSearch(q) {
-  for (const fn of [() => yts(q), ytScrape.bind(null, q)]) {
-    try { const r = await fn(); if (r?.videos?.length) return r; } catch(_) {}
-  }
-  return { videos: [] };
+        const c = [];
+        res.on('data', d => c.push(d));
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(c) }));
+      }
+    ).on('error', reject);
+  });
 }
 
 async function ytScrape(q) {
-  const r = await httpsGet(`https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`);
+  const r = await httpsGet(
+    `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`
+  );
   const m = r.body.toString().match(/var ytInitialData = (\{[\s\S]+?\});\s*<\/script>/);
   if (!m) return { videos: [] };
-  const data = JSON.parse(m[1]); const out = [];
-  for (const sec of (data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [])) {
+  const data = JSON.parse(m[1]);
+  const out = [];
+  for (const sec of (data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
+    ?.sectionListRenderer?.contents || [])) {
     for (const it of (sec?.itemSectionRenderer?.contents || [])) {
-      const v = it?.videoRenderer; if (!v?.videoId) continue;
+      const v = it?.videoRenderer;
+      if (!v?.videoId) continue;
       const lt = v.lengthText?.simpleText || '';
-      const secs = lt.split(':').map(Number).reduce((a,b2) => a*60+b2, 0);
-      out.push({ title: v.title?.runs?.[0]?.text || '', videoId: v.videoId, url: `https://www.youtube.com/watch?v=${v.videoId}`, author: { name: v.ownerText?.runs?.[0]?.text || '' }, duration: { seconds: secs, timestamp: lt }, timestamp: lt, views: Number((v.viewCountText?.simpleText||'0').replace(/\D/g,''))||0 });
+      const secs = lt.split(':').map(Number).reduce((a, b) => a * 60 + b, 0);
+      out.push({
+        title: v.title?.runs?.[0]?.text || '',
+        videoId: v.videoId,
+        url: `https://www.youtube.com/watch?v=${v.videoId}`,
+        author: { name: v.ownerText?.runs?.[0]?.text || '' },
+        duration: { seconds: secs, timestamp: lt },
+        timestamp: lt,
+        views: Number((v.viewCountText?.simpleText || '0').replace(/\D/g, '')) || 0,
+      });
       if (out.length >= 20) break;
     }
     if (out.length >= 20) break;
@@ -287,34 +77,196 @@ async function ytScrape(q) {
 
 function pickBest(vids, q) {
   const tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
-  const score  = v => {
-    const t = (v.title||'').toLowerCase(), a = (v.author?.name||'').toLowerCase();
+  const score = v => {
+    const t = (v.title || '').toLowerCase();
+    const a = (v.author?.name || '').toLowerCase();
     let s = 0;
-    tokens.forEach(k => { if(t.includes(k)) s+=3; if(a.includes(k)) s+=2; });
+    tokens.forEach(k => {
+      if (t.includes(k)) s += 3;
+      if (a.includes(k)) s += 2;
+    });
     if (/official\s+(audio|video|music)/i.test(v.title)) s += 3;
-    if (/\btopic\b|vevo/i.test(v.author?.name||''))       s += 3;
+    if (/\btopic\b|vevo/i.test(v.author?.name || ''))    s += 3;
     if (/reaction|tutorial|cover|sped.up|nightcore|slowed/i.test(v.title)) s -= 3;
     const sec = v.duration?.seconds || 0;
-    if (sec >= 45 && sec <= 720) s += 1; else if (sec > 720) s -= 2;
-    s += Math.min(3, Math.log10((v.views||1)+1) / 2);
+    if (sec >= 45 && sec <= 720) s += 1;
+    else if (sec > 720)          s -= 2;
+    s += Math.min(3, Math.log10((v.views || 1) + 1) / 2);
     return s;
   };
-  return vids.slice(0, 15).map(v => ({ v, s: score(v) })).sort((a,b) => b.s-a.s)[0]?.v || vids[0];
+  return vids.slice(0, 15).map(v => ({ v, s: score(v) })).sort((a, b) => b.s - a.s)[0]?.v || vids[0];
 }
 
 // ---------------------------------------------------------------------------
-// Lyrics
+// Audio download — Strategy 1: @distube/ytdl-core (pure JS, no binary needed)
+// ---------------------------------------------------------------------------
+function downloadWithYtdlCore(videoUrl) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const stream = ytdl(videoUrl, {
+      filter: 'audioonly',
+      quality: 'highestaudio',
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+      },
+    });
+    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      if (buf.length < 2048) return reject(new Error('ytdl-core: output too small'));
+      resolve({ buf, source: 'ytdl-core', mime: 'audio/mp4' });
+    });
+    stream.on('error', err => reject(new Error('ytdl-core: ' + (err.message || '').slice(0, 200))));
+    // Hard timeout: kill stream if it takes too long
+    const timer = setTimeout(() => {
+      stream.destroy(new Error('ytdl-core: timeout'));
+    }, 120000);
+    stream.on('close', () => clearTimeout(timer));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Audio download — Strategy 2: Cobalt API (handles YouTube nsig, no binary)
+// ---------------------------------------------------------------------------
+const COBALT_INSTANCES = [
+  'https://api.cobalt.tools',
+  'https://cobalt.catvibers.me',
+  'https://co.wuk.sh',
+];
+
+async function downloadWithCobalt(videoUrl) {
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const body = JSON.stringify({
+        url: videoUrl,
+        downloadMode: 'audio',
+        audioFormat: 'mp3',
+        filenameStyle: 'basic',
+      });
+      const res = await new Promise((resolve, reject) => {
+        const p = new URL(base);
+        const req = https.request(
+          {
+            hostname: p.hostname,
+            path: '/',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+              'User-Agent': 'Mozilla/5.0',
+              'Content-Length': Buffer.byteLength(body),
+            },
+          },
+          resp => {
+            const chunks = [];
+            resp.on('data', c => chunks.push(c));
+            resp.on('end', () =>
+              resolve({ status: resp.statusCode, body: Buffer.concat(chunks).toString() })
+            );
+          }
+        );
+        req.on('error', reject);
+        req.setTimeout(20000, () => req.destroy(new Error('cobalt timeout')));
+        req.write(body);
+        req.end();
+      });
+      if (res.status !== 200) continue;
+      const data = JSON.parse(res.body);
+      if (!['tunnel', 'redirect', 'stream'].includes(data.status) || !data.url) continue;
+      const dl = await httpsGet(data.url);
+      if (dl.status === 200 && dl.body.length > 2048) {
+        return { buf: dl.body, source: `cobalt(${base.replace('https://', '')})`, mime: 'audio/mpeg' };
+      }
+    } catch (_) {}
+  }
+  throw new Error('all cobalt instances failed');
+}
+
+// ---------------------------------------------------------------------------
+// Main download orchestrator — tries ytdl-core first, falls back to Cobalt
+// ---------------------------------------------------------------------------
+async function downloadAudio(url) {
+  const errs = [];
+
+  // Strategy 1: @distube/ytdl-core — pure JS, most reliable
+  try {
+    return await downloadWithYtdlCore(url);
+  } catch (e) {
+    errs.push('ytdl-core: ' + (e.message || '').slice(0, 120));
+  }
+
+  // Strategy 2: Cobalt API — handles YouTube bot-check, no binary needed
+  try {
+    return await downloadWithCobalt(url);
+  } catch (e) {
+    errs.push('cobalt: ' + (e.message || '').slice(0, 120));
+  }
+
+  throw new Error(errs.join(' | '));
+}
+
+// ---------------------------------------------------------------------------
+// Convert any audio buffer → MP3 via ffmpeg
+// ---------------------------------------------------------------------------
+function toMp3(buf, mime) {
+  return new Promise(resolve => {
+    const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const ext = (mime || '').includes('webm') ? 'webm' : 'mp4';
+    const inp = `/tmp/play_${id}.${ext}`;
+    const out = `/tmp/play_${id}.mp3`;
+    fs.writeFileSync(inp, buf);
+    execFile(
+      'ffmpeg',
+      ['-y', '-i', inp, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', out],
+      { timeout: 120000, maxBuffer: 80 * 1024 * 1024 },
+      err => {
+        try { fs.unlinkSync(inp); } catch (_) {}
+        if (!err) {
+          try {
+            const mp3 = fs.readFileSync(out);
+            fs.unlinkSync(out);
+            resolve(mp3);
+            return;
+          } catch (_) {}
+        }
+        try { fs.unlinkSync(out); } catch (_) {}
+        resolve(buf); // return original if ffmpeg fails
+      }
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Lyrics helper
 // ---------------------------------------------------------------------------
 async function fetchLyrics(q) {
   const parts  = q.split(/\s*-\s*/);
   const artist = parts.length > 1 ? parts[0].trim() : '';
   const song   = (parts.length > 1 ? parts.slice(1).join(' - ') : q).trim();
-  const tryUrl = async url => { try { const r = await httpsGet(url); return r.status===200 ? JSON.parse(r.body.toString()) : null; } catch(_) { return null; } };
+  const tryUrl = async url => {
+    try {
+      const r = await httpsGet(url);
+      return r.status === 200 ? JSON.parse(r.body.toString()) : null;
+    } catch (_) { return null; }
+  };
   const d1 = await tryUrl(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`);
-  if (Array.isArray(d1)) { const h = d1.find(x => x.plainLyrics || x.syncedLyrics); if (h) { const text = h.plainLyrics || (h.syncedLyrics||'').replace(/\[\d{2}:\d{2}(?:\.\d+)?\]/g,'').trim(); if (text) return { text, title: `${h.artistName} — ${h.trackName}` }; } }
-  if (artist && song) { const d2 = await tryUrl(`https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(song)}`); if (d2?.plainLyrics) return { text: d2.plainLyrics, title: `${d2.artistName} — ${d2.trackName}` }; }
+  if (Array.isArray(d1)) {
+    const h = d1.find(x => x.plainLyrics || x.syncedLyrics);
+    if (h) {
+      const text = h.plainLyrics || (h.syncedLyrics || '').replace(/\[\d{2}:\d{2}(?:\.\d+)?\]/g, '').trim();
+      if (text) return { text, title: `${h.artistName} — ${h.trackName}` };
+    }
+  }
+  if (artist && song) {
+    const d2 = await tryUrl(
+      `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(song)}`
+    );
+    if (d2?.plainLyrics) return { text: d2.plainLyrics, title: `${d2.artistName} — ${d2.trackName}` };
+  }
   const d3 = await tryUrl(`https://some-random-api.com/lyrics?title=${encodeURIComponent(q)}`);
-  if (d3?.lyrics) return { text: d3.lyrics, title: d3.title ? `${d3.author||''} — ${d3.title}` : null };
+  if (d3?.lyrics) return { text: d3.lyrics, title: d3.title ? `${d3.author || ''} — ${d3.title}` : null };
   return null;
 }
 
@@ -323,80 +275,58 @@ async function fetchLyrics(q) {
 // ---------------------------------------------------------------------------
 module.exports = [
   {
-    name: 'play', aliases: ['song', 'mp3', 'ytmp3'],
-    description: 'Send audio for a song name',
+    name: 'play',
+    aliases: ['song', 'mp3', 'ytmp3'],
+    description: 'Search YouTube and send audio for a song',
     handler: async ({ argText, sock, jid, m, reply }) => {
       if (!argText) return reply('Usage: .play <song name>');
+
       await reply(`🔎 Searching *${argText}*...`);
+
+      // 1. Search YouTube
       const r = await ytSearch(argText);
       const v = r.videos.length ? pickBest(r.videos, argText) : null;
-      if (!v) return reply('❌ Not found on YouTube.');
-      await reply(`🎵 Found: *${v.title}* — downloading audio…`);
+      if (!v) return reply('❌ No results found on YouTube.');
+
+      await reply(`🎵 Found: *${v.title}*\nDownloading audio…`);
+
+      // 2. Download audio
+      let buf, source, mime;
       try {
-        const { buf, source, mime } = await downloadAudio(v.url);
-        // Convert raw download to standard MP3 — invidious/piped return fragmented
-        // MP4 (DASH/CMAF) or webm which WhatsApp cannot play without conversion
-        let finalBuf = buf;
-        await new Promise((resolve) => {
-          const id = Date.now();
-          const ext = (mime||'').includes('webm') ? 'webm' : 'mp4';
-          const inp = `/tmp/play_${id}.${ext}`;
-          const out = `/tmp/play_${id}.mp3`;
-          fs.writeFileSync(inp, buf);
-          execFile('ffmpeg', ['-y', '-i', inp, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', out],
-            { timeout: 120000, maxBuffer: 80 * 1024 * 1024 },
-            (err) => {
-              try { fs.unlinkSync(inp); } catch(_) {}
-              if (!err) {
-                try { finalBuf = fs.readFileSync(out); fs.unlinkSync(out); } catch(_) {}
-              } else {
-                try { fs.unlinkSync(out); } catch(_) {}
-              }
-              resolve();
-            }
-          );
-        });
-        await sock.sendMessage(jid, { audio: finalBuf, mimetype: 'audio/mpeg', ptt: false }, { quoted: m });
-        await reply(`🎵 *${v.title}*\n${v.author?.name||''} · ${v.timestamp||''}\n_via ${source}_`);
-      } catch(e) {
-        reply(`❌ Failed: *${v.title}*\n_${e.message?.slice(0, 300)}_`);
+        ({ buf, source, mime } = await downloadAudio(v.url));
+      } catch (e) {
+        return reply(`❌ Download failed:\n_${e.message?.slice(0, 300)}_`);
       }
+
+      // 3. Convert to MP3 with ffmpeg so WhatsApp can play it
+      const finalBuf = await toMp3(buf, mime);
+
+      // 4. Send as audio message
+      await sock.sendMessage(jid, { audio: finalBuf, mimetype: 'audio/mpeg', ptt: false }, { quoted: m });
+      await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}\n_via ${source}_`);
     },
   },
+
   {
-    name: 'ytdlpcheck', aliases: ['musiccheck', 'checkytdlp'],
-    description: 'Diagnose yt-dlp and YouTube connectivity',
-    handler: async ({ reply }) => {
-      const bin = await getYtdlp();
-      if (!bin) return reply('❌ yt-dlp: *not found*\n\nCheck Railway build logs — the Dockerfile install step may have failed.');
-      const ver = await new Promise(r => execFile(bin, ['--version'], { timeout: 6000 }, (e,o) => r(e?'error':o.trim())));
-      const cookies = ensureCookies();
-      const cookieStatus = cookies ? `✅ loaded (${fs.statSync(cookies).size} bytes)` : '❌ not set — YouTube blocks cloud IPs without cookies';
-      const ytTest = await new Promise(r => {
-        const args = ['--get-url','--no-warnings','--extractor-args','youtube:player_client=ios','--user-agent','com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)'];
-        if (cookies) args.push('--cookies', cookies);
-        args.push('https://www.youtube.com/watch?v=60ItHLz5WEA');
-        execFile(bin, args, { timeout: 30000 }, (e,o,se) => {
-          if (e) r('❌ Blocked:\n_' + (se||e.message||'unknown').slice(0,220) + '_\n\n*Set YOUTUBE_COOKIES in Railway to fix this.*');
-          else r('✅ Working! YouTube is reachable.');
-        });
-      });
-      reply(`*Music Diagnostics*\n\nPath: \`${bin}\`\nVersion: ${ver}\nCookies: ${cookieStatus}\n\nYouTube test: ${ytTest}`);
-    },
-  },
-  {
-    name: 'ytsearch', aliases: ['ysearch'],
-    description: 'YouTube search results',
+    name: 'ytsearch',
+    aliases: ['ysearch'],
+    description: 'Show YouTube search results',
     handler: async ({ argText, reply }) => {
       if (!argText) return reply('Usage: .ytsearch <query>');
       const r = await ytSearch(argText);
       const top = r.videos.slice(0, 6);
       if (!top.length) return reply('Nothing found.');
-      reply(top.map(v => `• ${v.title}\n  ${v.timestamp||''} · ${v.author?.name||''}\n  ${v.url}`).join('\n\n'));
+      reply(
+        top
+          .map(v => `• ${v.title}\n  ${v.timestamp || ''} · ${v.author?.name || ''}\n  ${v.url}`)
+          .join('\n\n')
+      );
     },
   },
+
   {
-    name: 'lyrics', description: 'Fetch song lyrics',
+    name: 'lyrics',
+    description: 'Fetch song lyrics',
     handler: async ({ argText, reply }) => {
       if (!argText) return reply('Usage: .lyrics <song>  or  .lyrics Artist - Song');
       const r = await fetchLyrics(argText);
@@ -406,6 +336,18 @@ module.exports = [
       reply(header + body);
     },
   },
-  { name: 'ringtone', description: 'Ringtone search link', handler: async ({ argText, reply }) => reply(`https://www.zedge.net/find/ringtones/${encodeURIComponent(argText||'top')}`) },
-  { name: 'scloud',   description: 'SoundCloud search',    handler: async ({ argText, reply }) => reply(`https://soundcloud.com/search?q=${encodeURIComponent(argText||'top')}`) },
+
+  {
+    name: 'ringtone',
+    description: 'Ringtone search link',
+    handler: async ({ argText, reply }) =>
+      reply(`https://www.zedge.net/find/ringtones/${encodeURIComponent(argText || 'top')}`),
+  },
+
+  {
+    name: 'scloud',
+    description: 'SoundCloud search link',
+    handler: async ({ argText, reply }) =>
+      reply(`https://soundcloud.com/search?q=${encodeURIComponent(argText || 'top')}`),
+  },
 ];
