@@ -202,28 +202,56 @@ async function downloadAudio(url) {
     errs.push('yt-dlp: binary not found');
   }
 
-  // Strategy 3: Invidious public instances (updated list)
+  // Strategy 3: Invidious — use /latest_version proxy endpoint so audio is served by
+  // Invidious (not YouTube CDN). Cloud IPs can reach Invidious but not YouTube CDN directly.
   const INVIDIOUS = [
     'https://inv.nadeko.net',
     'https://invidious.privacyredirect.com',
     'https://iv.ggtyler.dev',
-    'https://invidious.fdn.fr',
     'https://yewtu.be',
+    'https://invidious.fdn.fr',
   ];
-  const vid = url.match(/[?&]v=([A-Za-z0-9_-]{11})/)?.[1];
+  const vid = url.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1];
   if (vid) {
     for (const base of INVIDIOUS) {
-      try {
-        const r = await httpsGet(`${base}/api/v1/videos/${vid}?fields=adaptiveFormats`);
-        if (r.status !== 200) continue;
-        const d = JSON.parse(r.body.toString());
-        const streamUrl = (d.adaptiveFormats||[]).find(f => f.type?.includes('audio/mp4'))?.url;
-        if (!streamUrl) continue;
-        const dl = await httpsGet(streamUrl);
-        if (dl.status === 200 && dl.body.length > 2048) return { buf: dl.body, source: 'invidious', mime: 'audio/mp4' };
-      } catch(_) {}
+      // itag 140 = audio/mp4 @128kbps proxied through Invidious (&local=true)
+      for (const itag of ['140', '251']) {
+        try {
+          const dl = await httpsGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`);
+          if (dl.status === 200 && dl.body.length > 4096) {
+            return { buf: dl.body, source: 'invidious', mime: itag === '140' ? 'audio/mp4' : 'audio/webm' };
+          }
+        } catch(_) {}
+      }
     }
     errs.push('invidious: all instances failed');
+  }
+
+  // Strategy 4: Piped API — another open-source YouTube frontend with proxied audio streams
+  const PIPED = [
+    'https://pipedapi.kavin.rocks',
+    'https://piped-api.garudalinux.org',
+    'https://api.piped.projectsegfau.lt',
+  ];
+  if (vid) {
+    for (const base of PIPED) {
+      try {
+        const r = await httpsGet(`${base}/streams/${vid}`);
+        if (r.status !== 200) continue;
+        const d = JSON.parse(r.body.toString());
+        const streams = (d.audioStreams || []).sort((a, b) => (b.bitrate||0) - (a.bitrate||0));
+        for (const s of streams) {
+          if (!s.url) continue;
+          try {
+            const dl = await httpsGet(s.url);
+            if (dl.status === 200 && dl.body.length > 4096) {
+              return { buf: dl.body, source: 'piped', mime: s.mimeType || 'audio/mp4' };
+            }
+          } catch(_) {}
+        }
+      } catch(_) {}
+    }
+    errs.push('piped: all instances failed');
   }
 
   throw new Error(errs.join(' | '));
