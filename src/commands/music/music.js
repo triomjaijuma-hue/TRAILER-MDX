@@ -49,8 +49,6 @@ function ytdlpDownload(url, kind) {
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificate',
-      // Use web_embedded player — bypasses YouTube PO-token bot detection
-      // on cloud-server IPs without needing cookies or OAuth.
       '--extractor-args', 'youtube:player_client=web_embedded,web',
       '--user-agent', UA,
       '--max-filesize', String(MAX_MEDIA_BYTES),
@@ -73,6 +71,111 @@ function ytdlpDownload(url, kind) {
       } catch (e) { reject(e); }
     });
   });
+}
+
+// --- Cobalt (cobalt.tools) -----------------------------------------------
+// Cobalt already supports YouTube audio & video extraction.
+// It's used in download.js for social media — we reuse the same approach here.
+const COBALT_BASES = [
+  'https://api.cobalt.tools',
+  'https://cobalt.tools/api/json',
+];
+
+async function cobaltFetch(ytUrl, kind) {
+  const body = kind === 'audio'
+    ? { url: ytUrl, downloadMode: 'audio', audioFormat: 'mp3' }
+    : { url: ytUrl, downloadMode: 'auto', videoQuality: '480' };
+  for (const base of COBALT_BASES) {
+    try {
+      const r = await axios.post(base, body, {
+        timeout: 30000,
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'User-Agent': UA,
+        },
+        validateStatus: () => true,
+      });
+      if (r.status >= 500) continue;
+      const d = r.data;
+      if (!d) continue;
+      if (d?.status === 'error') continue;
+      // v10: { status: 'redirect'|'tunnel', url }  legacy: { status: 'success'|'stream', url, audio }
+      const url = d?.url || d?.audio;
+      if (url && /^https?:\/\//.test(url)) return { directUrl: url, source: 'cobalt' };
+    } catch (_) {}
+  }
+  throw new Error('cobalt: all instances failed');
+}
+
+// --- Free API wrappers (no key needed) -----------------------------------
+// These public community APIs wrap yt-dlp server-side.
+const FREE_AUDIO_APIS = [
+  {
+    name: 'y2api',
+    build: (u) => `https://api.y2api.com/api/convert?url=${encodeURIComponent(u)}&format=mp3`,
+    pick: (d) => d?.download_url || d?.url || d?.link,
+  },
+  {
+    name: 'davidcyril',
+    build: (u) => `https://api.davidcyriltech.xyz/download/ytmp3?url=${encodeURIComponent(u)}`,
+    pick: (d) => d?.result?.download_url || d?.audio?.url || d?.url,
+  },
+  {
+    name: 'dreaded',
+    build: (u) => `https://api.dreaded.site/api/ytdl/audio?url=${encodeURIComponent(u)}`,
+    pick: (d) => d?.result?.url || d?.url,
+  },
+  {
+    name: 'agatz',
+    build: (u) => `https://api.agatz.xyz/api/ytmp3?url=${encodeURIComponent(u)}`,
+    pick: (d) => d?.data?.download || d?.data?.url || d?.url,
+  },
+];
+const FREE_VIDEO_APIS = [
+  {
+    name: 'davidcyril',
+    build: (u) => `https://api.davidcyriltech.xyz/download/ytmp4?url=${encodeURIComponent(u)}`,
+    pick: (d) => d?.result?.download_url || d?.video?.url || d?.url,
+  },
+  {
+    name: 'dreaded',
+    build: (u) => `https://api.dreaded.site/api/ytdl/video?url=${encodeURIComponent(u)}`,
+    pick: (d) => d?.result?.url || d?.url,
+  },
+  {
+    name: 'agatz',
+    build: (u) => `https://api.agatz.xyz/api/ytmp4?url=${encodeURIComponent(u)}`,
+    pick: (d) => d?.data?.download || d?.data?.url || d?.url,
+  },
+];
+
+async function resolveDirectUrl(providers, ytUrl) {
+  const errors = [];
+  for (const p of providers) {
+    try {
+      const cfg = { timeout: 25000, headers: { 'User-Agent': UA, Accept: 'application/json' }, validateStatus: () => true };
+      const r = await axios.get(p.build(ytUrl), cfg);
+      if (r.status >= 400) { errors.push(`${p.name}: HTTP ${r.status}`); continue; }
+      const direct = p.pick(r.data);
+      if (direct && /^https?:\/\//.test(direct)) return { direct, source: p.name };
+      errors.push(`${p.name}: no url in response`);
+    } catch (e) { errors.push(`${p.name}: ${e.message?.slice(0, 60) || 'failed'}`); }
+  }
+  throw new Error(errors.join(' | ') || 'no provider responded');
+}
+
+async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
+  const r = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 120000,
+    maxContentLength: cap,
+    maxBodyLength: cap,
+    headers: { 'User-Agent': UA },
+  });
+  const buf = Buffer.from(r.data);
+  if (buf.length < 1024) throw new Error('downloaded payload too small');
+  return buf;
 }
 
 // --- @distube/ytdl-core --------------------------------------------------
@@ -160,8 +263,6 @@ async function invidiosFetch(ytUrl, kind) {
 }
 
 // --- Piped ---------------------------------------------------------------
-// Piped is another YouTube front-end — stream URLs are different from
-// Invidious so they serve as an independent fallback.
 const PIPED_STREAM_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
@@ -184,7 +285,6 @@ async function pipedFetch(ytUrl, kind) {
         const pick = streams[0];
         if (pick?.url) return { directUrl: pick.url, source: 'piped' };
       } else {
-        // videoStreams that are NOT video-only (combined) or fall back to highest res video-only
         const streams = (data?.videoStreams || [])
           .filter(s => s.mimeType?.includes('mp4'))
           .sort((a, b) => (b.height || 0) - (a.height || 0));
@@ -199,69 +299,12 @@ async function pipedFetch(ytUrl, kind) {
   throw new Error('all piped instances failed');
 }
 
-// --- API wrapper fallbacks -----------------------------------------------
-const AUDIO_PROVIDERS = [
-  {
-    name: 'davidcyril',
-    build: (u) => `https://api.davidcyriltech.xyz/download/ytmp3?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.download_url || d?.audio?.url || d?.url,
-  },
-  {
-    name: 'dreaded',
-    build: (u) => `https://api.dreaded.site/api/ytdl/audio?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.url || d?.url,
-  },
-];
-const VIDEO_PROVIDERS = [
-  {
-    name: 'davidcyril',
-    build: (u) => `https://api.davidcyriltech.xyz/download/ytmp4?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.download_url || d?.video?.url || d?.url,
-  },
-  {
-    name: 'dreaded',
-    build: (u) => `https://api.dreaded.site/api/ytdl/video?url=${encodeURIComponent(u)}`,
-    pick: (d) => d?.result?.url || d?.url,
-  },
-];
-
-async function resolveDirectUrl(providers, ytUrl) {
-  const errors = [];
-  for (const p of providers) {
-    try {
-      const cfg = { timeout: 25000, headers: { 'User-Agent': UA, Accept: 'application/json' }, validateStatus: () => true };
-      const r = p.method === 'POST'
-        ? await axios.post(p.build(ytUrl), p.body(ytUrl), cfg)
-        : await axios.get(p.build(ytUrl), cfg);
-      if (r.status >= 400) { errors.push(`${p.name}: HTTP ${r.status}`); continue; }
-      const direct = p.pick(r.data);
-      if (direct && /^https?:\/\//.test(direct)) return { direct, source: p.name };
-      errors.push(`${p.name}: no url in response`);
-    } catch (e) { errors.push(`${p.name}: ${e.message?.slice(0, 60) || 'failed'}`); }
-  }
-  throw new Error(errors.join(' | ') || 'no provider responded');
-}
-
-async function downloadCapped(url, cap = MAX_MEDIA_BYTES) {
-  const r = await axios.get(url, {
-    responseType: 'arraybuffer',
-    timeout: 120000,
-    maxContentLength: cap,
-    maxBodyLength: cap,
-    headers: { 'User-Agent': UA },
-  });
-  const buf = Buffer.from(r.data);
-  if (buf.length < 1024) throw new Error('downloaded payload too small');
-  return buf;
-}
-
 // --- Main download chain -------------------------------------------------
-// yt-dlp (with player_client bypass) → Invidious → Piped → ytdl-core → API wrappers
+// Order: yt-dlp → Cobalt → Invidious → Piped → ytdl-core → free API wrappers
 async function fetchYouTubeMedia(url, kind) {
   const errors = [];
 
-  // 1. yt-dlp — most reliable; Dockerfile installs it system-wide.
-  //    Uses web_embedded player client to skip PO-token bot detection.
+  // 1. yt-dlp — most reliable when installed; uses web_embedded player bypass.
   if (await probeYtdlp()) {
     try { return { buf: await ytdlpDownload(url, kind), source: 'yt-dlp' }; }
     catch (e) { errors.push(`yt-dlp: ${e.message?.slice(0, 150)}`); }
@@ -269,24 +312,30 @@ async function fetchYouTubeMedia(url, kind) {
     errors.push('yt-dlp: not in PATH');
   }
 
-  // 2. Invidious public instances
+  // 2. Cobalt — free YouTube downloader, works on most server IPs.
+  try {
+    const { directUrl, source } = await cobaltFetch(url, kind);
+    return { buf: await downloadCapped(directUrl), source };
+  } catch (e) { errors.push(`cobalt: ${e.message?.slice(0, 100)}`); }
+
+  // 3. Invidious public instances
   try {
     const { directUrl, source } = await invidiosFetch(url, kind);
     return { buf: await downloadCapped(directUrl), source };
   } catch (e) { errors.push(`invidious: ${e.message?.slice(0, 100)}`); }
 
-  // 3. Piped public instances (different CDN from Invidious)
+  // 4. Piped public instances
   try {
     const { directUrl, source } = await pipedFetch(url, kind);
     return { buf: await downloadCapped(directUrl), source };
   } catch (e) { errors.push(`piped: ${e.message?.slice(0, 100)}`); }
 
-  // 4. ytdl-core (often blocked on cloud IPs in 2026 but worth trying)
+  // 5. ytdl-core (often blocked on cloud IPs but worth trying)
   try { return { buf: await ytdlCoreDownload(url, kind), source: 'ytdl-core' }; }
   catch (e) { errors.push(`ytdl-core: ${e.message?.slice(0, 100)}`); }
 
-  // 5. Community wrapper APIs
-  const providers = kind === 'audio' ? AUDIO_PROVIDERS : VIDEO_PROVIDERS;
+  // 6. Free community wrapper APIs
+  const providers = kind === 'audio' ? FREE_AUDIO_APIS : FREE_VIDEO_APIS;
   try {
     const { direct, source } = await resolveDirectUrl(providers, url);
     return { buf: await downloadCapped(direct), source };
@@ -428,7 +477,7 @@ async function fetchLyrics(query) {
 
 function stripLrcTimestamps(s) {
   if (!s) return '';
-  return s.replace(/\[\d{2}:\d{2}(?:\.\d{1,3})?\]\s?/g, '').trim();
+  return s.replace(/\[\d{2}:\d{2}(?:\.\d{1,3})?\]/g, '').trim();
 }
 
 // --- Commands ------------------------------------------------------------
@@ -452,15 +501,21 @@ module.exports = [
     handler: async ({ argText, sock, jid, m, reply }) => {
       if (!argText) return reply('Usage: .play <song name>');
       await reply(`🔎 Searching *${argText}*...`);
-      const v = await search(argText);
-      if (!v) return reply('Not found on YouTube.');
-      await reply(`🎵 Found: *${v.title}* — downloading...`);
+      let v;
+      try { v = await search(argText); } catch (e) { return reply(`Search error: ${e.message?.slice(0, 100)}`); }
+      if (!v) return reply('❌ Not found on YouTube.');
+      await reply(`🎵 Found: *${v.title}* — downloading audio...`);
       try {
         const { buf, source } = await fetchYouTubeMedia(v.url, 'audio');
-        await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mp4', ptt: false, fileName: `${v.title}.mp3` }, { quoted: m });
+        await sock.sendMessage(jid, {
+          audio: buf,
+          mimetype: 'audio/mp4',
+          ptt: false,
+          fileName: `${v.title}.mp3`,
+        }, { quoted: m });
         await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || v.duration?.timestamp || ''}\n_via ${source}_`);
       } catch (e) {
-        reply(`❌ Download failed for *${v.title}*\n_${e.message?.slice(0, 200)}_`);
+        reply(`❌ Could not download *${v.title}*\n_All sources failed. Try again in a moment._\n\n_Error: ${e.message?.slice(0, 150)}_`);
       }
     },
   },
@@ -470,14 +525,19 @@ module.exports = [
     handler: async ({ argText, sock, jid, m, reply }) => {
       if (!argText) return reply('Usage: .video <name>');
       await reply(`🔎 Searching *${argText}*...`);
-      const v = await search(argText);
-      if (!v) return reply('Not found on YouTube.');
-      await reply(`🎬 Found: *${v.title}* — downloading...`);
+      let v;
+      try { v = await search(argText); } catch (e) { return reply(`Search error: ${e.message?.slice(0, 100)}`); }
+      if (!v) return reply('❌ Not found on YouTube.');
+      await reply(`🎬 Found: *${v.title}* — downloading video...`);
       try {
         const { buf, source } = await fetchYouTubeMedia(v.url, 'video');
-        await sock.sendMessage(jid, { video: buf, mimetype: 'video/mp4', caption: `🎬 *${v.title}*\n_via ${source}_` }, { quoted: m });
+        await sock.sendMessage(jid, {
+          video: buf,
+          mimetype: 'video/mp4',
+          caption: `🎬 *${v.title}*\n_via ${source}_`,
+        }, { quoted: m });
       } catch (e) {
-        reply(`❌ Video download failed for *${v.title}*\n_${e.message?.slice(0, 200)}_\n\n_Try *.play ${argText}* for audio instead._`);
+        reply(`❌ Could not download *${v.title}*\n_All sources failed. Try again in a moment._\n\n_Error: ${e.message?.slice(0, 150)}_\n\n_Try *.play ${argText}* for audio instead._`);
       }
     },
   },
