@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg", "libwebp", "vips", "yt-dlp"]
+nixPkgs = ["nodejs_20", "ffmpeg", "libwebp", "vips", "yt-dlp", "espeak-ng"]
 
 [phases.install]
 cmds = ["npm install --omit=dev --no-audit --no-fund"]
