@@ -238,9 +238,15 @@ function loadCookies() {
 }
 
 const YT_CLIENTS = [
-  { client: 'ios',         ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
-  { client: 'tv_embedded', ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1' },
-  { client: 'web',         ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+  // android_testsuite uses a restricted-API endpoint that often bypasses Railway IP blocks
+  { client: 'android_testsuite', ua: 'com.google.android.youtube/1.9.38.43 (Linux; U; Android 9; US) gzip' },
+  // android is the standard Android app API — different CDN routing than web
+  { client: 'android',           ua: 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip' },
+  { client: 'ios',               ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
+  { client: 'tv_embedded',       ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1' },
+  // mweb (mobile web) — different JS player with looser geo-IP checks in some regions
+  { client: 'mweb',              ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1' },
+  { client: 'web',               ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
 ];
 
 async function downloadWithYtdlp(videoUrl) {
@@ -456,6 +462,15 @@ const INVIDIOUS_INSTANCES = [
   'https://iv.ggtyler.dev',
   'https://yewtu.be',
   'https://invidious.io.lol',
+  // Additional instances added 2026-05-02 for better Railway coverage
+  'https://invidious.fdn.fr',
+  'https://inv.riverside.rocks',
+  'https://invidious.tiekoetter.com',
+  'https://inv.bp.projectsegfau.lt',
+  'https://invidious.perennialte.ch',
+  'https://vid.puffyan.us',
+  'https://invidious.lunar.icu',
+  'https://yt.cdaut.de',
 ];
 
 async function downloadWithInvidious(videoUrl) {
@@ -1059,7 +1074,7 @@ module.exports = [
 
       await sock.sendMessage(
         jid,
-        { video: buf, mimetype: 'video/mp4', caption: `${source === 'audio+thumb' ? '🎵' : '🎬'} *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}${source === 'audio+thumb' ? '\n_Official Audio (real video unavailable on this server)_' : `\n_via ${source}_`}` },
+        { video: buf, mimetype: 'video/mp4', caption: `${source === 'audio+thumb' ? '🎵' : '🎬'} *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}\n_${source === 'audio+thumb' ? 'Official Audio' : 'via ' + source}_` },
         { quoted: m }
       );
     },
