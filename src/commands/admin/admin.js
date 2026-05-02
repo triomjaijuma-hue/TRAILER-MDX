@@ -277,4 +277,22 @@ module.exports = [
       store.set({ aiOn: s.aiOn }); ctx.reply(`chatbot: ${s.aiOn[ctx.jid] ? 'on' : 'off'}`);
     },
   },
+  {
+    name: 'groupsecurity', aliases: ['gsec', 'securitymon'], group,
+    description: 'Monitor group for suspicious admin changes: .groupsecurity on/off',
+    handler: async (ctx) => {
+      const meta = await adminGuard(ctx); if (!meta) return;
+      const on = /on|true|1|enable/i.test(ctx.argText);
+      const s = store.get();
+      s.groupSecurity = s.groupSecurity || {};
+      if (on) { s.groupSecurity[ctx.jid] = true; }
+      else { delete s.groupSecurity[ctx.jid]; }
+      store.set({ groupSecurity: s.groupSecurity });
+      ctx.reply(
+        on
+          ? shield + ' *Group Security Monitor ON*\n\nYou will receive a DM whenever:\n\u2022 Someone is promoted to admin\n\u2022 Someone is demoted from admin\n\u2022 The bot itself is demoted\n\u2022 Someone is added by a non-admin'
+          : lock + ' Group Security Monitor OFF'
+      );
+    },
+  },
 ];

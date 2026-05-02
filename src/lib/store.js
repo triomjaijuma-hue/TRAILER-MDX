@@ -23,6 +23,7 @@ const defaults = () => ({
   badwords: [],      // global list (lowercased)
   welcome: {},       // { groupJid: { enabled, text } }
   goodbye: {},       // { groupJid: { enabled, text } }
+  groupSecurity: {}, // { groupJid: true } — alert owner on admin changes
   notes: {},         // { jidOrGlobal: { name: text } }
   warns: {},         // { groupJid: { userJid: count } }
   replies: {},       // { keyword: response }

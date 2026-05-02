@@ -400,16 +400,85 @@ async function start() {
     }
   });
 
-  // Welcome / goodbye on group-participants.update
+  // Welcome / goodbye + group security monitor on group-participants.update
   sock.ev.on('group-participants.update', async (ev) => {
     try {
       const s = store.get();
       const jid = ev.id;
       if (!jid?.endsWith('@g.us')) return;
       const meta = await sock.groupMetadata(jid).catch(() => null);
-      const groupName = meta?.subject || 'this group';
+      const groupName = meta?.subject || jid;
       const memberCount = meta?.participants?.length || 0;
+      const myJid = sock.user?.id ? sock.user.id.replace(/:\d+/, '') : null;
+      const ownerJid = myJid; // bot number IS owner in this setup
 
+      // ── Group Security Monitor ─────────────────────────────────────────────
+      // Alerts the owner's DM whenever admin privileges change in any group
+      // where .groupsecurity is enabled.
+      if (s.groupSecurity?.[jid]) {
+        const action = ev.action;
+        const author = ev.author || null; // who made the change (WhatsApp provides this)
+        const authorTag = author ? `+${author.split('@')[0]}` : 'unknown';
+
+        if (action === 'promote') {
+          // Someone was promoted to admin
+          for (const p of ev.participants || []) {
+            const pTag = `+${p.split('@')[0]}`;
+            const isSelf = myJid && p.replace(/:\d+/, '') === myJid;
+            const alert =
+              `🚨 *ADMIN PROMOTED* in *${groupName}*
+` +
+              `👤 Promoted: ${isSelf ? '🤖 Bot itself' : pTag}
+` +
+              `✍️ By: ${authorTag}
+` +
+              `🕐 ${new Date().toLocaleString('en-GB', { timeZone: 'Africa/Kampala' })}
+` +
+              `🔗 Group: ${jid}`;
+            if (ownerJid) await sock.sendMessage(ownerJid + '@s.whatsapp.net', { text: alert }).catch(() => {});
+          }
+        } else if (action === 'demote') {
+          // Someone was demoted from admin — especially dangerous if it's the bot
+          for (const p of ev.participants || []) {
+            const pTag = `+${p.split('@')[0]}`;
+            const isSelf = myJid && p.replace(/:\d+/, '') === myJid;
+            const alert =
+              `⚠️ *ADMIN REMOVED* in *${groupName}*
+` +
+              (isSelf ? `🤖 *The bot was demoted from admin!*
+` : `👤 Demoted: ${pTag}
+`) +
+              `✍️ By: ${authorTag}
+` +
+              `🕐 ${new Date().toLocaleString('en-GB', { timeZone: 'Africa/Kampala' })}
+` +
+              `🔗 Group: ${jid}`;
+            if (ownerJid) await sock.sendMessage(ownerJid + '@s.whatsapp.net', { text: alert }).catch(() => {});
+          }
+        } else if (action === 'add') {
+          // Someone was added — alert if not done by a known admin
+          const knownAdmins = (meta?.participants || [])
+            .filter(p => p.admin)
+            .map(p => p.id.replace(/:\d+/, ''));
+          const authorBase = author ? author.replace(/:\d+/, '') : null;
+          const addedByAdmin = !authorBase || knownAdmins.includes(authorBase);
+          if (!addedByAdmin) {
+            for (const p of ev.participants || []) {
+              const alert =
+                `🚨 *UNKNOWN ADD* in *${groupName}*
+` +
+                `👤 Added: +${p.split('@')[0]}
+` +
+                `✍️ By: ${authorTag} (not a known admin)
+` +
+                `🕐 ${new Date().toLocaleString('en-GB', { timeZone: 'Africa/Kampala' })}`;
+              if (ownerJid) await sock.sendMessage(ownerJid + '@s.whatsapp.net', { text: alert }).catch(() => {});
+            }
+          }
+        }
+      }
+
+      // ── Welcome / Goodbye messages ─────────────────────────────────────────
       const isAdd = ev.action === 'add';
       const isRemove = ev.action === 'remove' || ev.action === 'leave';
       const cfg = isAdd ? s.welcome[jid] : isRemove ? s.goodbye[jid] : null;
