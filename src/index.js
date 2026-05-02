@@ -24,11 +24,32 @@ if (!process.env.BOT_CHILD) {
   const { spawn } = require('child_process');
   const path      = require('path');
 
-  let child    = null;
-  let stopping = false;
+  let child      = null;
+  let stopping   = false;
+  let restarting = false; // guard: only ONE restart may be pending at a time
+
+  // Schedule a single restart 2 s from now.  Both the 'exit' and 'error'
+  // events on a ChildProcess can fire for the same crash (Node.js allows it).
+  // Without this guard, both would each call startChild() → two children →
+  // two simultaneous WhatsApp sessions → session key conflicts → bot goes mad.
+  function scheduleRestart(reason) {
+    if (stopping || restarting) return;
+    restarting = true;
+    console.log(`[supervisor] ${reason} — restarting in 2 s`);
+    setTimeout(() => {
+      restarting = false;
+      startChild();
+    }, 2000);
+  }
 
   function startChild() {
     if (stopping) return;
+
+    // Safety net: if a previous child is somehow still alive, kill it before
+    // spawning a new one so we never have two instances connected at once.
+    if (child && !child.killed) {
+      try { child.kill('SIGKILL'); } catch (_) {}
+    }
 
     child = spawn(process.execPath, [path.resolve(__filename)], {
       env:     { ...process.env, BOT_CHILD: '1' },
@@ -38,16 +59,12 @@ if (!process.env.BOT_CHILD) {
 
     child.on('exit', (code, signal) => {
       if (stopping) return;
-      console.log(
-        `[supervisor] child exited (code=${code ?? '?'} signal=${signal ?? 'none'})` +
-        ` — restarting in 2 s`
-      );
-      setTimeout(startChild, 2000);
+      scheduleRestart(`child exited (code=${code ?? '?'} signal=${signal ?? 'none'})`);
     });
 
     child.on('error', (err) => {
       console.error('[supervisor] child spawn error:', err.message);
-      if (!stopping) setTimeout(startChild, 2000);
+      scheduleRestart(`child spawn error: ${err.message}`);
     });
   }
 
