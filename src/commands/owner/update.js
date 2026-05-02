@@ -71,6 +71,7 @@ const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
 const PRESERVE = new Set([
   'auth_info',
   'node_modules',
+  'bin',           // keep downloaded yt-dlp binary
   '.env',
   '.env.local',
   '.env.production',

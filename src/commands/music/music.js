@@ -215,9 +215,40 @@ async function getYtdlp() {
     return _ytdlp;
   }
 
+  // 5. Self-download yt-dlp binary from GitHub releases (~10 sec once per container boot)
+  try {
+    const autoBin = '/tmp/yt-dlp';
+    let needDl = true;
+    try { if (fs.statSync(autoBin).size > 1_000_000) needDl = false; } catch (_) {}
+    if (needDl) {
+      const buf = await new Promise((resolve, reject) => {
+        function get(url, hops) {
+          if (hops > 5) return reject(new Error('too many redirects'));
+          const mod = url.startsWith('https') ? https : http;
+          mod.get(url, { headers: { 'User-Agent': 'yt-dlp-autoinstall' }, timeout: 60000 }, (r) => {
+            if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location)
+              return get(r.headers.location, hops + 1);
+            if (r.statusCode !== 200) { r.resume(); return reject(new Error('HTTP ' + r.statusCode)); }
+            const chunks = [];
+            r.on('data', c => chunks.push(c));
+            r.on('end', () => resolve(Buffer.concat(chunks)));
+            r.on('error', reject);
+          }).on('error', reject);
+        }
+        get('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp', 0);
+      });
+      fs.writeFileSync(autoBin, buf);
+      fs.chmodSync(autoBin, 0o755);
+    }
+    if (await testCmd(autoBin, ['--version'])) {
+      _ytdlp = { bin: autoBin, prefix: [] };
+      return _ytdlp;
+    }
+  } catch (_) {}
+
   return null;
 }
-getYtdlp().catch(() => {}); // warm up on startup
+getYtdlp().catch(() => {}); // warm up on startup — also triggers self-download if needed
 
 function loadCookies() {
   // 1. Already written to disk this session
@@ -386,18 +417,49 @@ async function downloadWithSoundCloud(query) {
   const errs = [];
   for (const track of tracks.slice(0, 3)) {
     try {
-      // Get the stream URL
-      const streamUrl = track.stream_url
-        || track.media?.transcodings?.find(t => t.format?.protocol === 'progressive')?.url;
-      if (!streamUrl) continue;
-      const resolved = await httpGet(`${streamUrl}?client_id=${clientId}`, 5, { Accept: 'application/json' });
-      if (resolved.status !== 200) continue;
-      const { url } = JSON.parse(resolved.body.toString());
-      if (!url) continue;
-      const dl = await httpGet(url, 5);
-      if (!isAudioBuffer(dl.body)) continue;
+      // Collect all stream URLs: prefer progressive (direct MP3), then HLS
+      const transcodings = track.media?.transcodings || [];
+      const streamUrls = [
+        track.stream_url,
+        ...transcodings.filter(t => t.format?.protocol === 'progressive').map(t => t.url),
+        ...transcodings.filter(t => t.format?.protocol === 'hls').map(t => t.url),
+      ].filter(Boolean);
+      if (!streamUrls.length) continue;
+
+      let dlBuf = null;
+      for (const streamUrl of streamUrls) {
+        try {
+          const resolved = await httpGet(`${streamUrl}?client_id=${clientId}`, 5, { Accept: 'application/json' });
+          if (resolved.status !== 200) continue;
+          let body;
+          try { body = JSON.parse(resolved.body.toString()); } catch (_) { continue; }
+          const streamHref = body.url || body.Location;
+          if (!streamHref) continue;
+
+          // HLS streams: use ffmpeg to download and decode to MP3
+          if (streamHref.includes('.m3u8')) {
+            const id = Date.now().toString(36);
+            const out = `/tmp/sc_hls_${id}.mp3`;
+            try {
+              await new Promise((res, rej) => {
+                execFile('ffmpeg', ['-y', '-i', streamHref, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', out],
+                  { timeout: 90000 }, (err) => err ? rej(err) : res());
+              });
+              const hlsBuf = fs.readFileSync(out);
+              try { fs.unlinkSync(out); } catch (_) {}
+              if (isAudioBuffer(hlsBuf)) { dlBuf = hlsBuf; break; }
+            } catch (_) { continue; }
+          } else {
+            const dl = await httpGet(streamHref, 5);
+            if (!isAudioBuffer(dl.body)) continue;
+            dlBuf = dl.body;
+            break;
+          }
+        } catch (_) {}
+      }
+      if (!dlBuf) continue;
       return {
-        buf: dl.body,
+        buf: dlBuf,
         source: `soundcloud(${track.user?.username || 'unknown'})`,
         mime: 'audio/mpeg',
         title: `${track.user?.username || ''} — ${track.title}`,
@@ -467,14 +529,14 @@ async function downloadWithSoundCloudYtdlp(query) {
 // Wide instance pool — different IPs behave differently from Railway vs Replit
 // Testing from Replit does NOT predict Railway behaviour, so keep them all
 const INVIDIOUS_INSTANCES = [
-  'https://inv.thepixora.com',
-  'https://invidious.nerdvpn.de',
-  'https://invidious.projectsegfau.lt',
-  'https://inv.nadeko.net',
-  'https://invidious.privacyredirect.com',
-  'https://yewtu.be',
-  'https://invidious.fdn.fr',
-  'https://invidious.io.lol',
+  'https://inv.nadeko.net',          // Reliable — NZ-based, low latency
+  'https://invidious.io.lol',        // Good uptime
+  'https://yewtu.be',                // NL-based, long-running
+  'https://invidious.lunar.icu',     // EU-based
+  'https://iv.datura.network',       // Active community instance
+  'https://invidious.perennialte.ch', // CH-based
+  'https://invidious.nerdvpn.de',    // DE-based
+  'https://inv.thepixora.com',       // Backup
 ];
 
 async function downloadWithInvidious(videoUrl) {
@@ -505,12 +567,11 @@ async function downloadWithInvidious(videoUrl) {
 // Strategy 4: Cobalt
 // ---------------------------------------------------------------------------
 const COBALT_INSTANCES = [
-  'https://api.cobalt.tools',
-  'https://cobalt.catvibers.me',
-  'https://cobalt.zt.ag',
-  'https://dl.cgm.rs',
-  'https://cobalt.lunar.icu',
-  'https://cobalt.api.timelessnesses.me',
+  'https://cobalt.zt.ag',                    // Community — reliable
+  'https://dl.cgm.rs',                       // Community — RS-based
+  'https://cobalt.lunar.icu',               // Community — EU
+  'https://cobalt.api.timelessnesses.me',   // Community backup
+  'https://api.cobalt.tools',               // Official — may rate-limit
 ];
 
 async function downloadWithCobalt(videoUrl) {
@@ -595,8 +656,7 @@ async function downloadVideoWithCobalt(videoUrl) {
       const body = JSON.stringify({
         url: videoUrl,
         downloadMode: 'video',
-        videoQuality: '360',
-        filenameStyle: 'basic',
+        videoQuality: '720',
       });
       const p = new URL(base);
       const res = await new Promise((resolve, reject) => {
