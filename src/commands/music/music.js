@@ -237,16 +237,17 @@ function loadCookies() {
   return null;
 }
 
+// Audio yt-dlp clients — tried in order for .play/.song
 const YT_CLIENTS = [
-  // android_testsuite uses a restricted-API endpoint that often bypasses Railway IP blocks
   { client: 'android_testsuite', ua: 'com.google.android.youtube/1.9.38.43 (Linux; U; Android 9; US) gzip' },
-  // android is the standard Android app API — different CDN routing than web
-  { client: 'android',           ua: 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip' },
   { client: 'ios',               ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
   { client: 'tv_embedded',       ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1' },
-  // mweb (mobile web) — different JS player with looser geo-IP checks in some regions
-  { client: 'mweb',              ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1' },
-  { client: 'web',               ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+];
+
+// Video yt-dlp clients — fewer + faster timeouts to avoid blocking the fallback chain
+const YT_VIDEO_CLIENTS = [
+  { client: 'android_testsuite', ua: 'com.google.android.youtube/1.9.38.43 (Linux; U; Android 9; US) gzip' },
+  { client: 'ios',               ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
 ];
 
 async function downloadWithYtdlp(videoUrl) {
@@ -452,25 +453,14 @@ async function downloadWithSoundCloudYtdlp(query) {
 // Wide instance pool — different IPs behave differently from Railway vs Replit
 // Testing from Replit does NOT predict Railway behaviour, so keep them all
 const INVIDIOUS_INSTANCES = [
-  'https://inv.thepixora.com',           // worked for Despacito on Railway
+  'https://inv.thepixora.com',
   'https://invidious.nerdvpn.de',
   'https://invidious.projectsegfau.lt',
-  'https://invidious.slipfox.xyz',
-  'https://inv.in.projectsegfau.lt',
   'https://inv.nadeko.net',
   'https://invidious.privacyredirect.com',
-  'https://iv.ggtyler.dev',
   'https://yewtu.be',
-  'https://invidious.io.lol',
-  // Additional instances added 2026-05-02 for better Railway coverage
   'https://invidious.fdn.fr',
-  'https://inv.riverside.rocks',
-  'https://invidious.tiekoetter.com',
-  'https://inv.bp.projectsegfau.lt',
-  'https://invidious.perennialte.ch',
-  'https://vid.puffyan.us',
-  'https://invidious.lunar.icu',
-  'https://yt.cdaut.de',
+  'https://invidious.io.lol',
 ];
 
 async function downloadWithInvidious(videoUrl) {
@@ -544,7 +534,7 @@ async function downloadVideoWithYtdlp(videoUrl) {
   if (!ytdlp) throw new Error('yt-dlp not available');
   const cookiesFile = loadCookies();
   const errs = [];
-  for (const { client, ua } of YT_CLIENTS) {
+  for (const { client, ua } of YT_VIDEO_CLIENTS) {
     try {
       const buf = await new Promise((resolve, reject) => {
         const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
@@ -558,8 +548,8 @@ async function downloadVideoWithYtdlp(videoUrl) {
           '--extractor-args', `youtube:player_client=${client}`,
           '--user-agent', ua,
           '--max-filesize', '60m',
-          '--socket-timeout', '45',
-          '--retries', '2',
+          '--socket-timeout', '20',
+          '--retries', '1',
           ...(cookiesFile ? ['--cookies', cookiesFile] : []),
           '-o', out,
           videoUrl,
