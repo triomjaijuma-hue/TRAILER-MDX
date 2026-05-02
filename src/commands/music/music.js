@@ -369,15 +369,13 @@ async function downloadWithSoundCloud(query) {
 // ---------------------------------------------------------------------------
 // Strategy 3: Invidious  — video-id-based audio proxy
 // ---------------------------------------------------------------------------
-// Confirmed live instances (tested 2026-05-02 — return 200 for /latest_version?itag=18&local=true)
+// TRUE PROXY instances only — tested without -L flag (200 = server fetches & serves itself)
+// 301/302 instances redirect to YouTube CDN which blocks Railway IPs — do NOT add those back
 const INVIDIOUS_INSTANCES = [
-  'https://iv.ggtyler.dev',
-  'https://invidious.nerdvpn.de',
-  'https://invidious.projectsegfau.lt',
-  // Extras — may or may not work depending on day
-  'https://inv.nadeko.net',
-  'https://invidious.tiekoetter.com',
-  'https://invidious.perennialte.ch',
+  'https://invidious.nerdvpn.de',       // 200 ✅ true proxy
+  'https://invidious.projectsegfau.lt', // 200 ✅ true proxy
+  'https://invidious.slipfox.xyz',      // 200 ✅ true proxy
+  'https://inv.in.projectsegfau.lt',    // 200 ✅ true proxy
 ];
 
 async function downloadWithInvidious(videoUrl) {
