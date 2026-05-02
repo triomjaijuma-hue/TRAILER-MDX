@@ -8,7 +8,9 @@ const path    = require('path');
 const helpers = require('../../lib/helpers');
 const config  = require('../../lib/config');
 
-const MIN_AUDIO_BYTES = 64 * 1024; // 64 KB minimum — real songs are always larger
+const MIN_AUDIO_BYTES = 64 * 1024;   // 64 KB minimum for audio
+const MIN_VIDEO_BYTES = 500 * 1024;  // 500 KB minimum for video
+const MAX_VIDEO_BYTES = 60 * 1024 * 1024; // 60 MB WhatsApp cap
 
 // ---------------------------------------------------------------------------
 // Magic-byte audio validation — rejects HTML pages, JSON errors, stubs
@@ -22,6 +24,17 @@ function isAudioBuffer(buf) {
   if (buf.slice(0, 4).toString('ascii') === 'OggS') return true;           // OGG
   if (buf.slice(0, 4).toString('ascii') === 'RIFF') return true;           // WAV
   if (buf.slice(0, 4).toString('ascii') === 'fLaC') return true;           // FLAC
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Magic-byte video validation
+// ---------------------------------------------------------------------------
+function isVideoBuffer(buf) {
+  if (!buf || buf.length < MIN_VIDEO_BYTES) return false;
+  if (buf.length > 11 && buf.slice(4, 8).toString('ascii') === 'ftyp') return true; // MP4/M4V
+  if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return true; // WebM/MKV
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF') return true; // AVI
   return false;
 }
 
@@ -418,6 +431,153 @@ async function downloadWithCobalt(videoUrl) {
 }
 
 // ---------------------------------------------------------------------------
+// Video download strategies
+// ---------------------------------------------------------------------------
+
+async function downloadVideoWithYtdlp(videoUrl) {
+  const ytdlp = await getYtdlp();
+  if (!ytdlp) throw new Error('yt-dlp not available');
+  const cookiesFile = loadCookies();
+  const errs = [];
+  for (const { client, ua } of YT_CLIENTS) {
+    try {
+      const buf = await new Promise((resolve, reject) => {
+        const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+        const out = `/tmp/vid_${id}.mp4`;
+        const args = [
+          ...ytdlp.prefix,
+          // 480p MP4 — small enough for WhatsApp, good quality
+          '-f', 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best',
+          '--merge-output-format', 'mp4',
+          '--no-playlist', '--no-warnings', '--no-check-certificate',
+          '--extractor-args', `youtube:player_client=${client}`,
+          '--user-agent', ua,
+          '--max-filesize', '60m',
+          '--socket-timeout', '45',
+          '--retries', '2',
+          ...(cookiesFile ? ['--cookies', cookiesFile] : []),
+          '-o', out,
+          videoUrl,
+        ];
+        execFile(ytdlp.bin, args, { timeout: 300000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
+          if (err) {
+            try { fs.unlinkSync(out); } catch (_) {}
+            return reject(new Error(`[${client}] ${(se || err.message || '').split('\n').slice(-3).join(' ').slice(0, 200)}`));
+          }
+          try {
+            const buf = fs.readFileSync(out);
+            try { fs.unlinkSync(out); } catch (_) {}
+            resolve(buf);
+          } catch (e) { reject(e); }
+        });
+      });
+      if (!isVideoBuffer(buf)) throw new Error(`[${client}] not valid video (${buf.length} bytes)`);
+      if (buf.length > MAX_VIDEO_BYTES) throw new Error(`[${client}] too large for WhatsApp (${(buf.length / 1e6).toFixed(1)} MB)`);
+      return { buf, source: `yt-dlp[${client}]`, mime: 'video/mp4' };
+    } catch (e) { errs.push((e.message || '').slice(0, 150)); }
+  }
+  throw new Error('yt-dlp video: ' + errs.join(' | '));
+}
+
+async function downloadVideoWithCobalt(videoUrl) {
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const body = JSON.stringify({
+        url: videoUrl,
+        downloadMode: 'auto',
+        videoQuality: '480',
+        filenameStyle: 'basic',
+      });
+      const p = new URL(base);
+      const res = await new Promise((resolve, reject) => {
+        const req = https.request(
+          { hostname: p.hostname, path: p.pathname || '/', method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', 'Content-Length': Buffer.byteLength(body) } },
+          resp => { const c = []; resp.on('data', d => c.push(d)); resp.on('end', () => resolve({ status: resp.statusCode, body: Buffer.concat(c).toString() })); }
+        );
+        req.on('error', reject);
+        req.setTimeout(25000, () => req.destroy(new Error('timeout')));
+        req.write(body); req.end();
+      });
+      if (res.status !== 200) continue;
+      const data = JSON.parse(res.body);
+      if (!['tunnel', 'redirect', 'stream'].includes(data.status) || !data.url) continue;
+      const dl = await httpGet(data.url);
+      if (!isVideoBuffer(dl.body)) continue;
+      if (dl.body.length > MAX_VIDEO_BYTES) continue;
+      return { buf: dl.body, source: `cobalt(${p.hostname})`, mime: 'video/mp4' };
+    } catch (_) {}
+  }
+  throw new Error('cobalt video: all instances failed');
+}
+
+// Invidious video — itag 18 = 360p MP4, itag 22 = 720p MP4 (may exceed size limit)
+async function downloadVideoWithInvidious(videoUrl) {
+  const vid = videoUrl.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1];
+  if (!vid) throw new Error('cannot extract video ID');
+  const errs = [];
+  for (const base of INVIDIOUS_INSTANCES) {
+    for (const itag of ['18', '22']) {
+      try {
+        const r = await httpGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`);
+        const ct = (r.headers['content-type'] || '').toLowerCase();
+        if (ct.includes('html') || ct.includes('json') || ct.includes('text')) continue;
+        if (!isVideoBuffer(r.body)) continue;
+        if (r.body.length > MAX_VIDEO_BYTES) continue;
+        return { buf: r.body, source: `invidious(${base.split('/')[2]})`, mime: 'video/mp4' };
+      } catch (e) { errs.push(`${base.split('/')[2]}[${itag}]: ${(e.message || '').slice(0, 50)}`); }
+    }
+  }
+  throw new Error('invidious video: ' + errs.join(' | '));
+}
+
+// ffmpeg: re-encode to H.264/AAC MP4 that WhatsApp accepts
+function toMp4(buf, mime) {
+  if ((mime || '').includes('mp4') && buf.length <= MAX_VIDEO_BYTES) return Promise.resolve(buf);
+  return new Promise((resolve, reject) => {
+    const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const ext = (mime || '').includes('webm') ? 'webm' : 'mkv';
+    const inp = `/tmp/vid_${id}.${ext}`;
+    const out = `/tmp/vid_${id}.mp4`;
+    fs.writeFileSync(inp, buf);
+    execFile('ffmpeg', [
+      '-y', '-i', inp,
+      '-vf', 'scale=trunc(oh*a/2)*2:480',   // 480p, keep aspect ratio
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '28',
+      '-c:a', 'aac', '-b:a', '96k',
+      '-movflags', '+faststart',              // streaming-ready
+      '-fs', String(MAX_VIDEO_BYTES),         // hard size cap
+      out,
+    ], { timeout: 240000, maxBuffer: 100 * 1024 * 1024 }, err => {
+      try { fs.unlinkSync(inp); } catch (_) {}
+      if (err) {
+        try { fs.unlinkSync(out); } catch (_) {}
+        return reject(new Error('ffmpeg: ' + (err.message || '').slice(0, 150)));
+      }
+      try {
+        const mp4 = fs.readFileSync(out);
+        try { fs.unlinkSync(out); } catch (_) {}
+        if (!isVideoBuffer(mp4)) return reject(new Error('ffmpeg: output not valid video'));
+        resolve(mp4);
+      } catch (e) { reject(e); }
+    });
+  });
+}
+
+async function downloadVideo(query, videoUrl) {
+  const errs = [];
+  for (const [label, fn] of [
+    ['yt-dlp',    () => downloadVideoWithYtdlp(videoUrl)],
+    ['cobalt',    () => downloadVideoWithCobalt(videoUrl)],
+    ['invidious', () => downloadVideoWithInvidious(videoUrl)],
+  ]) {
+    try { return await fn(); }
+    catch (e) { errs.push(`${label}: ${(e.message || '').slice(0, 150)}`); }
+  }
+  throw new Error(errs.join('\n'));
+}
+
+// ---------------------------------------------------------------------------
 // Main download orchestrator
 // ---------------------------------------------------------------------------
 async function downloadAudio(query, videoUrl) {
@@ -592,6 +752,52 @@ module.exports = [
       const header = r.title ? `🎤 *${r.title}*\n\n` : '';
       const body   = r.text.length > 3500 ? r.text.slice(0, 3500) + '\n\n_…truncated_' : r.text;
       reply(header + body);
+    },
+  },
+
+  {
+    name: 'video',
+    aliases: ['ytmp4', 'vid', 'yvideo'],
+    description: 'Search YouTube and send a video (480p, max 60 MB)',
+    handler: async ({ argText, sock, jid, m, reply }) => {
+      if (!argText) return reply('Usage: .video <song or video name>');
+
+      await reply(`🔎 Searching *${argText}*...`);
+
+      const r = await ytSearch(argText);
+      const v = r.videos.length ? pickBest(r.videos, argText) : null;
+      if (!v) return reply('❌ No results found on YouTube.');
+
+      // Warn early if video is very long
+      const dur = v.duration?.seconds || 0;
+      if (dur > 600) return reply(`❌ *${v.title}* is ${v.timestamp} — too long for WhatsApp video.\nTry *.play* to get audio only.`);
+
+      await reply(`🎬 Found: *${v.title}*\nDownloading video (480p)…`);
+
+      let result;
+      try {
+        result = await downloadVideo(argText, v.url);
+      } catch (e) {
+        return reply(`❌ Video download failed:\n_${e.message?.slice(0, 500)}_`);
+      }
+
+      let { buf, source, mime } = result;
+
+      // Re-encode to standard MP4 if needed
+      if (!mime?.includes('mp4')) {
+        try { buf = await toMp4(buf, mime); }
+        catch (e) { return reply(`❌ Conversion failed:\n_${e.message?.slice(0, 200)}_`); }
+      }
+
+      if (buf.length > MAX_VIDEO_BYTES) {
+        return reply(`❌ File too large (${(buf.length / 1e6).toFixed(1)} MB). WhatsApp limit is 60 MB.\nTry *.play* for audio only.`);
+      }
+
+      await sock.sendMessage(
+        jid,
+        { video: buf, mimetype: 'video/mp4', caption: `🎬 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}\n_via ${source}_` },
+        { quoted: m }
+      );
     },
   },
 
