@@ -797,6 +797,60 @@ async function downloadVideoWithInvidious(videoUrl) {
   throw new Error('invidious video: ' + errs.join(' | '));
 }
 
+// ---------------------------------------------------------------------------
+// Strategy 1b: Invidious JSON API → proxy URL rewrite
+// ---------------------------------------------------------------------------
+// GET /api/v1/videos/{id} returns formatStreams with direct URLs.
+// If those URLs point to googlevideo.com (YouTube CDN), we rewrite them to
+// go through the Invidious /videoplayback proxy instead — same result,
+// but the Invidious server makes the actual YouTube CDN request.
+async function downloadVideoWithInvidiousApi(videoUrl) {
+  const vid = videoUrl.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1];
+  if (!vid) throw new Error('cannot extract video ID');
+  const errs = [];
+  for (const base of INVIDIOUS_INSTANCES) {
+    try {
+      const info = await httpGet(
+        `${base}/api/v1/videos/${vid}?fields=formatStreams,adaptiveFormats`,
+        3, { Accept: 'application/json' }, 20000
+      );
+      if (info.status !== 200) { errs.push(`${base.split('/')[2]}: api ${info.status}`); continue; }
+      let data;
+      try { data = JSON.parse(info.body.toString()); } catch (_) { errs.push(`${base.split('/')[2]}: bad json`); continue; }
+
+      // formatStreams = combined video+audio MP4 (no ffmpeg needed)
+      const fmts = (data.formatStreams || [])
+        .filter(s => (s.container || s.type || '').includes('mp4') || s.itag === '18' || s.itag === '22')
+        .sort((a, b) => {
+          const qa = parseInt(a.resolution) || parseInt(a.qualityLabel) || 0;
+          const qb = parseInt(b.resolution) || parseInt(b.qualityLabel) || 0;
+          return qa - qb; // ascending: lowest quality first (smallest file)
+        });
+
+      const pick = fmts.find(s => (parseInt(s.resolution) || parseInt(s.qualityLabel) || 999) <= 480) || fmts[0];
+      if (!pick || !pick.url) { errs.push(`${base.split('/')[2]}: no combined mp4`); continue; }
+
+      // Rewrite direct YouTube CDN URL → Invidious /videoplayback proxy
+      let streamUrl = pick.url;
+      if (streamUrl.includes('googlevideo.com')) {
+        try {
+          const u = new URL(streamUrl);
+          streamUrl = `${base}/videoplayback${u.search}&local=true`;
+        } catch (_) {}
+      }
+
+      const dl = await httpGet(streamUrl, 3, {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Referer: base,
+      }, 120000);
+      if (!isVideoBuffer(dl.body)) { errs.push(`${base.split('/')[2]}: not video (${dl.body.length}b)`); continue; }
+      if (dl.body.length > MAX_VIDEO_BYTES) { errs.push(`${base.split('/')[2]}: too large`); continue; }
+      return { buf: dl.body, source: `invidious-api(${base.split('/')[2]})`, mime: 'video/mp4' };
+    } catch (e) { errs.push(`${base.split('/')[2]}: ${(e.message || '').slice(0, 60)}`); }
+  }
+  throw new Error('invidious-api: ' + errs.join(' | '));
+}
+
 // ffmpeg: re-encode to H.264/AAC MP4 that WhatsApp accepts
 function toMp4(buf, mime) {
   if ((mime || '').includes('mp4') && buf.length <= MAX_VIDEO_BYTES) return Promise.resolve(buf);
@@ -892,10 +946,13 @@ async function downloadVideoAsAudioThumb(query, videoId) {
 async function downloadVideo(query, videoUrl, videoId) {
   const errs = [];
 
-  // 1. Invidious proxy — proven to work on Railway (server fetches from YT, we fetch from server)
-  //    Tries itags 18/22/36/17 across 6 instances → highest coverage for all video types
+  // 1. Invidious latest_version proxy (120s timeout — server streams through Invidious)
   try { return await downloadVideoWithInvidious(videoUrl); }
   catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 150)}`); }
+
+  // 1b. Invidious JSON API — gets format list, rewrites CDN URLs as proxy URLs
+  try { return await downloadVideoWithInvidiousApi(videoUrl); }
+  catch (e) { errs.push(`invidious-api: ${(e.message || '').slice(0, 150)}`); }
 
   // 2. yt-dlp real video (works when installed on Railway)
   try { return await downloadVideoWithYtdlp(videoUrl); }
