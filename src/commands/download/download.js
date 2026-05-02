@@ -58,7 +58,68 @@ function makeFetcher(name, hint) {
 module.exports = [
   makeFetcher('facebook'),
   makeFetcher('instagram'),
-  makeFetcher('tiktok'),
+  // ── TikTok — real download via tikwm.com (no watermark) ──────────────
+  {
+    name: 'tiktok', aliases: ['tt', 'ttdl'],
+    description: 'Download TikTok video without watermark',
+    handler: async ({ sock, jid, m, argText, reply }) => {
+      const url = (argText || '').trim();
+      if (!url || !url.includes('tiktok')) return reply('Usage: .tiktok <TikTok URL>\nExample: .tiktok https://vm.tiktok.com/...');
+
+      await reply('⏳ Fetching TikTok video...');
+
+      // Strategy 1: tikwm.com — free, reliable, no-watermark
+      try {
+        const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`;
+        const r = await axios.get(apiUrl, {
+          timeout: 20000,
+          headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tikwm.com/' },
+          validateStatus: () => true,
+        });
+        const d = r.data?.data;
+        if (d?.play) {
+          // Download the actual video buffer
+          const vid = await axios.get(d.play, {
+            timeout: 60000,
+            responseType: 'arraybuffer',
+            headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tikwm.com/' },
+            validateStatus: () => true,
+          });
+          const buf = Buffer.from(vid.data);
+          if (buf.length > 500_000) {
+            const caption = `🎵 ${d.title || 'TikTok'}\n👤 ${d.author?.nickname || ''}\n\n_via tikwm (no watermark)_`;
+            await sock.sendMessage(jid, { video: buf, caption, mimetype: 'video/mp4' }, { quoted: m });
+            return;
+          }
+        }
+        // If video too small/missing, try wmplay (watermarked fallback)
+        if (d?.wmplay) {
+          const vid = await axios.get(d.wmplay, {
+            timeout: 60000, responseType: 'arraybuffer',
+            headers: { 'User-Agent': 'Mozilla/5.0' }, validateStatus: () => true,
+          });
+          const buf = Buffer.from(vid.data);
+          if (buf.length > 500_000) {
+            await sock.sendMessage(jid, { video: buf, caption: `🎵 ${d.title || 'TikTok'}\n_(watermark version)_`, mimetype: 'video/mp4' }, { quoted: m });
+            return;
+          }
+        }
+      } catch (_) {}
+
+      // Strategy 2: Cobalt fallback (sends URL only)
+      try {
+        const result = await cobaltResolve(url, false);
+        if (result.url) {
+          return reply(`✅ Download link (Cobalt):\n${result.url}`);
+        }
+        if (result.picker?.length) {
+          return reply(`🎬 TikTok links:\n${result.picker.join('\n')}`);
+        }
+      } catch (_) {}
+
+      reply('❌ Could not download this TikTok. Make sure the link is a valid public TikTok video URL.');
+    },
+  },
   makeFetcher('twitter'),
   makeFetcher('snapchat'),
   makeFetcher('sharechat'),
