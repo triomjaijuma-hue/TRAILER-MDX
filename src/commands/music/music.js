@@ -41,8 +41,9 @@ function isVideoBuffer(buf) {
 // ---------------------------------------------------------------------------
 // Shared HTTP helper (follows redirects, returns status + headers + body)
 // ---------------------------------------------------------------------------
-function httpGet(url, maxRedir, extraHeaders) {
-  maxRedir = maxRedir == null ? 8 : maxRedir;
+function httpGet(url, maxRedir, extraHeaders, reqTimeout) {
+  maxRedir    = maxRedir    == null ? 8     : maxRedir;
+  reqTimeout  = reqTimeout  == null ? 30000 : reqTimeout;
   return new Promise((resolve, reject) => {
     let p;
     try { p = new URL(url); } catch (e) { return reject(e); }
@@ -56,7 +57,7 @@ function httpGet(url, maxRedir, extraHeaders) {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           ...extraHeaders,
         },
-        timeout: 30000,
+        timeout: reqTimeout,
       },
       res => {
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
@@ -65,7 +66,7 @@ function httpGet(url, maxRedir, extraHeaders) {
           let next;
           try { next = new URL(res.headers.location, url).href; }
           catch (e) { return reject(new Error('bad redirect URL: ' + res.headers.location)); }
-          return resolve(httpGet(next, maxRedir - 1, extraHeaders));
+          return resolve(httpGet(next, maxRedir - 1, extraHeaders, reqTimeout));
         }
         const chunks = [];
         res.on('data', d => chunks.push(d));
@@ -289,10 +290,12 @@ const YT_CLIENTS = [
   { client: 'tv_embedded',       ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1' },
 ];
 
-// Video yt-dlp clients — fewer + faster timeouts to avoid blocking the fallback chain
+// Video yt-dlp clients — web_creator/tv_embedded bypass bot checks better from cloud IPs
 const YT_VIDEO_CLIENTS = [
-  { client: 'android_testsuite', ua: 'com.google.android.youtube/1.9.38.43 (Linux; U; Android 9; US) gzip' },
+  { client: 'web_creator',       ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+  { client: 'tv_embedded',       ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1' },
   { client: 'ios',               ua: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iPhone OS 18_1_0 like Mac OS X)' },
+  { client: 'android_testsuite', ua: 'com.google.android.youtube/1.9.38.43 (Linux; U; Android 9; US) gzip' },
 ];
 
 async function downloadWithYtdlp(videoUrl) {
@@ -674,7 +677,8 @@ async function downloadVideoWithCobalt(videoUrl) {
       try { data = JSON.parse(res.body); } catch (_) { errs.push(`${p.hostname}: bad JSON`); continue; }
       // Only use tunnel/stream — Cobalt proxies through its own servers
       // Skip 'redirect' which points to YouTube CDN (blocked from Railway IPs)
-      if (!data.url || data.status === 'redirect') {
+      // 'picker' = multiple files (e.g. Twitter/Insta) — not useful for video here
+      if (!data.url || !['tunnel', 'stream'].includes(data.status)) {
         errs.push(`${p.hostname}: ${data.status || 'no url'} ${data.error?.code || ''}`);
         continue;
       }
@@ -733,10 +737,11 @@ async function downloadVideoWithYtdlCore(videoUrl) {
 // Strategy: Piped.video proxy — fetches video through Piped's own servers (not YouTube CDN)
 // Railway requests go to pipedproxy.*, not googlevideo.com → bypasses IP ban
 const PIPED_API_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.reallyaweso.me',
   'https://api.piped.yt',
   'https://piped-api.privacy.com.de',
+  'https://watchapi.whatever.social',
+  'https://api.piped.projectsegfau.lt',
+  'https://pipedapi.kavin.rocks',
 ];
 
 async function downloadVideoWithPiped(videoUrl) {
@@ -779,7 +784,7 @@ async function downloadVideoWithInvidious(videoUrl) {
     // Try combined formats in order: 360p → 480p (22 is 720p but often only available) → 240p → 144p
     for (const itag of ['18', '22', '36', '17']) {
       try {
-        const r = await httpGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`, 5);
+        const r = await httpGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`, 5, {}, 120000);
         const ct = (r.headers['content-type'] || '').toLowerCase();
         if (ct.includes('html') || ct.includes('json') || ct.includes('text')) continue;
         if (r.status === 404 || r.status === 403) continue; // itag not available for this video

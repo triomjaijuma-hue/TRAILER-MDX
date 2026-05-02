@@ -80,8 +80,35 @@ module.exports = [
     },
   },
   {
-    name: 'broadcastdm', owner, description: 'Broadcast to DM contacts',
-    handler: async ({ reply }) => reply('DM broadcast queued (limited to recent chats).'),
+    name: 'broadcastdm', owner, description: 'Broadcast DM to all group participants',
+    handler: async ({ sock, argText, reply }) => {
+      if (!argText) return reply('Usage: .broadcastdm <message>\nExample: .broadcastdm Hello everyone!');
+      // Collect unique participant JIDs from all groups the bot is in
+      let chats = {};
+      try { chats = await sock.groupFetchAllParticipating?.() || {}; } catch (_) {}
+      const ownerJid = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : '';
+      const seen = new Set();
+      for (const g of Object.values(chats)) {
+        for (const p of g.participants || []) {
+          const jid = p.id || p.jid;
+          if (jid && jid !== ownerJid && jid.endsWith('@s.whatsapp.net') && !seen.has(jid))
+            seen.add(jid);
+        }
+      }
+      const targets = [...seen];
+      if (!targets.length) return reply('⚠️ No contacts found. Make sure the bot is in at least one group.');
+      await reply(`📤 Sending DM to *${targets.length}* contacts...`);
+      let sent = 0, failed = 0;
+      for (const jid of targets) {
+        try {
+          await sock.sendMessage(jid, { text: argText });
+          sent++;
+        } catch (_) { failed++; }
+        // 1.5 s between messages — avoids WhatsApp rate-limit ban
+        await new Promise(r => setTimeout(r, 1500));
+      }
+      reply(`✅ Broadcast done.\n• Sent: *${sent}*\n• Failed: *${failed}*`);
+    },
   },
 
   // ----- replies (.addreply / .delreply / .listreplies) -----
