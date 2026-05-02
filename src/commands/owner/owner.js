@@ -336,6 +336,55 @@ module.exports = [
   { name: 'delcmd',   owner, description: '(advisory) Remove a command', handler: async ({ reply }) => reply('Edit the plugin file and re-run *.reload*.') },
   { name: 'manage',   owner, description: 'Open settings menu', handler: async ({ reply }) => reply('Use *.settings* to view bot toggles.') },
   {
+    name: 'ytcookies', aliases: ['setcookies', 'ytcookie'], owner,
+    description: 'Save YouTube cookies so .video downloads real video (bypasses Railway IP block)',
+    handler: async ({ argText, reply }) => {
+      const s = store.get();
+
+      if (/^clear$/i.test((argText || '').trim())) {
+        store.set({ ytCookies: null });
+        try { require('fs').unlinkSync('/tmp/yt-cookies.txt'); } catch (_) {}
+        return reply('YouTube cookies cleared. .video will use the fallback chain.');
+      }
+
+      if (!argText || !argText.trim()) {
+        const has = !!s.ytCookies;
+        return reply(
+          '*YouTube Cookies — ' + (has ? '✅ ACTIVE' : '❌ NOT SET') + '*\n\n' +
+          (has
+            ? 'Cookies saved. yt-dlp uses your YouTube session for video downloads.\n\n'
+            : 'No cookies saved. .video falls back to audio+thumbnail on Railway.\n\n') +
+          '*One-time setup:*\n' +
+          '1. Install \"Get cookies.txt LOCALLY\" in Chrome/Firefox\n' +
+          '2. Log into youtube.com\n' +
+          '3. Click extension → Export for youtube.com → save cookies.txt\n' +
+          '4. Open https://www.base64encode.org\n' +
+          '5. Paste the cookies.txt content → Encode → Copy result\n' +
+          '6. Send: .ytcookies <base64>\n\n' +
+          'Cookies survive restarts (stored in session backup).\n' +
+          'To remove: .ytcookies clear'
+        );
+      }
+
+      const b64 = argText.trim();
+      let decoded;
+      try { decoded = Buffer.from(b64, 'base64').toString('utf8'); }
+      catch (e) { return reply('❌ Invalid base64. Copy the full encoded string.'); }
+
+      if (!decoded.includes('youtube.com'))
+        return reply('❌ Does not look like YouTube cookies (no youtube.com found). Export from youtube.com.');
+
+      try { require('fs').writeFileSync('/tmp/yt-cookies.txt', decoded); } catch (_) {}
+      store.set({ ytCookies: b64 });
+      return reply(
+        '✅ *YouTube cookies saved!*\n\n' +
+        'yt-dlp will authenticate with your YouTube session, bypassing the Railway IP block.\n' +
+        'Try *.video <song>* — it should download the real video now.'
+      );
+    },
+  },
+
+  {
     name: 'settings', owner, description: 'Show toggles',
     handler: async ({ reply }) => {
       const s = store.get();

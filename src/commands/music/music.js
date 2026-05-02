@@ -220,10 +220,24 @@ async function getYtdlp() {
 getYtdlp().catch(() => {}); // warm up on startup
 
 function loadCookies() {
+  // 1. Already written to disk this session
   const candidates = ['/tmp/yt-cookies.txt', path.join(__dirname, '../../../cookies.txt')];
   for (const f of candidates) {
     try { if (fs.statSync(f).size > 100) return f; } catch (_) {}
   }
+  // 2. Owner saved via .ytcookies command (persisted in store)
+  try {
+    const store = require('../lib/store');
+    const saved = store.get().ytCookies;
+    if (saved && typeof saved === 'string' && saved.length > 100) {
+      const decoded = Buffer.from(saved, 'base64').toString('utf8');
+      if (decoded.includes('youtube.com')) {
+        fs.writeFileSync('/tmp/yt-cookies.txt', decoded);
+        return '/tmp/yt-cookies.txt';
+      }
+    }
+  } catch (_) {}
+  // 3. Railway env var YOUTUBE_COOKIES or YT_COOKIES (base64-encoded cookies.txt)
   const b64 = process.env.YOUTUBE_COOKIES || process.env.YT_COOKIES;
   if (b64) {
     try {
@@ -580,8 +594,8 @@ async function downloadVideoWithCobalt(videoUrl) {
     try {
       const body = JSON.stringify({
         url: videoUrl,
-        downloadMode: 'auto',
-        videoQuality: '480',
+        downloadMode: 'video',
+        videoQuality: '360',
         filenameStyle: 'basic',
       });
       const p = new URL(base);
@@ -598,9 +612,12 @@ async function downloadVideoWithCobalt(videoUrl) {
       if (res.status !== 200) { errs.push(`${p.hostname}: HTTP ${res.status}`); continue; }
       let data;
       try { data = JSON.parse(res.body); } catch (_) { errs.push(`${p.hostname}: bad JSON`); continue; }
-      // status 'tunnel' = Cobalt serves from its own server (cloud-IP safe)
-      // status 'redirect' = direct YouTube CDN (may be blocked on Railway)
-      if (!data.url) { errs.push(`${p.hostname}: ${data.status || 'no url'} ${data.error?.code || ''}`); continue; }
+      // Only use tunnel/stream — Cobalt proxies through its own servers
+      // Skip 'redirect' which points to YouTube CDN (blocked from Railway IPs)
+      if (!data.url || data.status === 'redirect') {
+        errs.push(`${p.hostname}: ${data.status || 'no url'} ${data.error?.code || ''}`);
+        continue;
+      }
       const dl = await httpGet(data.url);
       if (!isVideoBuffer(dl.body)) { errs.push(`${p.hostname}: not video (${dl.body.length}b)`); continue; }
       if (dl.body.length > MAX_VIDEO_BYTES) { errs.push(`${p.hostname}: too large`); continue; }

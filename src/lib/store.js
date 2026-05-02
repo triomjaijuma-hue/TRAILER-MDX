@@ -24,6 +24,7 @@ const defaults = () => ({
   welcome: {},       // { groupJid: { enabled, text } }
   goodbye: {},       // { groupJid: { enabled, text } }
   groupSecurity: {}, // { groupJid: true } — alert owner on admin changes
+  ytCookies: null,   // base64 YouTube cookies.txt — set via .ytcookies command
   notes: {},         // { jidOrGlobal: { name: text } }
   warns: {},         // { groupJid: { userJid: count } }
   replies: {},       // { keyword: response }
