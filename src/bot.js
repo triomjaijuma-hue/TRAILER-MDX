@@ -232,7 +232,18 @@ async function start() {
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       logger.warn(`Disconnected (code=${code}). reconnect=${shouldReconnect}`);
-      if (shouldReconnect) setTimeout(start, 3000);
+      if (shouldReconnect) {
+        setTimeout(start, 3000);
+      } else {
+        // 401 = WhatsApp logged out this session. Clear the stale creds so the
+        // pairing page can immediately generate a fresh code without a restart.
+        sock = null;
+        lastPairCode = null;
+        avatarApplied = false;
+        try { fs.rmSync(config.paths.auth, { recursive: true, force: true }); } catch (_) {}
+        fs.mkdirSync(config.paths.auth, { recursive: true });
+        logger.info('Session cleared after logout — open the pairing page to link again.');
+      }
     }
   });
 
@@ -496,8 +507,18 @@ async function requestPairing(number) {
   if (hasSession() && connected) {
     throw new Error('Bot is already paired and connected. Use "Logout" first if you want a fresh code.');
   }
+  lastPairCode = null;
   pendingPairNumber = number;
+
   if (!sock) {
+    // No socket — start fresh
+    await start();
+  } else if (!connected && sock.authState?.creds?.registered) {
+    // Dead socket with stale registered creds (e.g. after 401 logout before
+    // the disconnect handler could clear them). Clear and restart.
+    sock = null;
+    try { fs.rmSync(config.paths.auth, { recursive: true, force: true }); } catch (_) {}
+    fs.mkdirSync(config.paths.auth, { recursive: true });
     await start();
   } else if (!sock.authState.creds.registered) {
     try {
@@ -507,8 +528,8 @@ async function requestPairing(number) {
       throw new Error(e?.message || 'requestPairingCode failed');
     }
   }
-  // Wait briefly for code generation triggered by start()
-  for (let i = 0; i < 15 && !lastPairCode; i++) await helpers.sleep(500);
+  // Wait up to 10s for code generation triggered by start()
+  for (let i = 0; i < 20 && !lastPairCode; i++) await helpers.sleep(500);
   if (!lastPairCode) throw new Error('Could not generate a pairing code. Try again.');
   return lastPairCode;
 }
