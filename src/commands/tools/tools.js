@@ -156,21 +156,39 @@ module.exports = [
              (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0);
     }
 
-    // Convert any audio buffer (mp3/wav) → OGG Opus so WhatsApp plays it as a voice note
+    // Convert any audio buffer (mp3/wav) → OGG Opus so WhatsApp plays it as a voice note.
+    // Returns { buf, seconds } — seconds must be passed explicitly to sock.sendMessage()
+    // because Baileys 6.7.x cannot auto-detect duration from raw OGG Opus buffers and
+    // defaults to seconds=0, which causes WhatsApp to show "audio not available".
     function toOgg(inputBuf, ext) {
       return new Promise((resolve, reject) => {
         const inp = `/tmp/tts_${id}_in.${ext}`;
         fs.writeFileSync(inp, inputBuf);
         execFile(
           'ffmpeg',
-          ['-y', '-i', inp, '-c:a', 'libopus', '-ar', '48000', '-ac', '1', '-b:a', '64k', ogg],
+          // -vn      : strip any video tracks (prevents muxer confusion)
+          // -application voip : Opus voice/speech mode (better than default 'audio' for TTS)
+          // -b:a 32k  : appropriate for mono voice; 64k was over-spec and some clients choked
+          ['-y', '-i', inp, '-vn', '-c:a', 'libopus', '-ar', '48000', '-ac', '1', '-b:a', '32k', '-application', 'voip', ogg],
           { timeout: 20000 },
           (err, _o, se) => {
             try { fs.unlinkSync(inp); } catch (_) {}
             if (err) return reject(new Error('ffmpeg: ' + (se || err.message).slice(0, 200)));
-            if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 500)
+            if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 100)
               return reject(new Error('ffmpeg: output too small — likely silent'));
-            resolve(fs.readFileSync(ogg));
+            const buf = fs.readFileSync(ogg);
+            // Parse encoded duration from ffmpeg progress line: "time=00:00:03.57"
+            // This is the actual OGG duration and must be passed to sendMessage so
+            // WhatsApp shows the correct waveform instead of "audio not available".
+            let seconds = 0;
+            const timeMatch = (se || '').match(/time=(d+):(d+):([d.]+)/g);
+            if (timeMatch && timeMatch.length) {
+              const last = timeMatch[timeMatch.length - 1];
+              const [, h, m, s] = last.match(/time=(d+):(d+):([d.]+)/);
+              seconds = parseInt(h) * 3600 + parseInt(m) * 60 + parseFloat(s);
+            }
+            if (seconds < 0.1) seconds = 1; // safe fallback — never send 0
+            resolve({ buf, seconds: Math.ceil(seconds) });
           }
         );
       });
@@ -280,9 +298,11 @@ module.exports = [
         audioBuf = await espeakTTS(); ext = 'wav';
       }
 
-      const oggBuf = await toOgg(audioBuf, ext);
+      const { buf: oggBuf, seconds: oggSeconds } = await toOgg(audioBuf, ext);
       cleanup();
-      await sock.sendMessage(jid, { audio: oggBuf, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: m });
+      // Pass seconds explicitly — Baileys cannot auto-detect OGG Opus duration and
+      // sends seconds=0 without this, making WhatsApp show "audio not available".
+      await sock.sendMessage(jid, { audio: oggBuf, mimetype: 'audio/ogg; codecs=opus', ptt: true, seconds: oggSeconds }, { quoted: m });
     } catch (e) {
       cleanup();
       reply(`❌ TTS failed: ${e?.message?.slice(0, 200)}`);
