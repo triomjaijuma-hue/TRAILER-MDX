@@ -525,25 +525,29 @@ async function downloadVideoWithCobalt(videoUrl) {
   throw new Error('cobalt: ' + errs.join(' | '));
 }
 
-// Strategy: @distube/ytdl-core — pure JS, itag 18 = 360p MP4 combined (video+audio, no ffmpeg needed)
+// Strategy: @distube/ytdl-core — pure JS, combined MP4 format (video+audio, no ffmpeg needed)
 async function downloadVideoWithYtdlCore(videoUrl) {
   const ytdl = require('@distube/ytdl-core');
   return new Promise((resolve, reject) => {
     let done = false;
     const chunks = [];
     let totalBytes = 0;
-    const timer = setTimeout(() => { if (!done) { done = true; stream.destroy(); reject(new Error('ytdl-core: timeout after 120s')); } }, 120000);
+    const timer = setTimeout(() => {
+      if (!done) { done = true; try { stream && stream.destroy(); } catch (_) {} reject(new Error('ytdl-core: timeout after 90s')); }
+    }, 90000);
     let stream;
     try {
       stream = ytdl(videoUrl, {
-        quality: 18,  // 360p MP4, combined video+audio — works without ffmpeg
+        // Filter for combined video+audio MP4 ≤ 480p — itag 18 (360p) or 22 (720p)
+        filter: f => f.hasVideo && f.hasAudio && f.container === 'mp4' && (f.height || 999) <= 480,
+        quality: 'lowest',
         requestOptions: { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } },
       });
     } catch (e) { clearTimeout(timer); return reject(new Error('ytdl-core init: ' + (e.message || '').slice(0, 100))); }
     stream.on('data', chunk => {
       totalBytes += chunk.length;
       if (totalBytes > MAX_VIDEO_BYTES) {
-        done = true; stream.destroy();
+        done = true; try { stream.destroy(); } catch (_) {}
         clearTimeout(timer);
         return reject(new Error(`ytdl-core: file exceeds ${MAX_VIDEO_BYTES / 1e6} MB`));
       }
@@ -554,7 +558,7 @@ async function downloadVideoWithYtdlCore(videoUrl) {
       done = true; clearTimeout(timer);
       const buf = Buffer.concat(chunks);
       if (!isVideoBuffer(buf)) return reject(new Error(`ytdl-core: not valid video (${buf.length}b)`));
-      resolve({ buf, source: 'ytdl-core(360p)', mime: 'video/mp4' });
+      resolve({ buf, source: 'ytdl-core', mime: 'video/mp4' });
     });
     stream.on('error', e => {
       if (done) return;
@@ -562,6 +566,45 @@ async function downloadVideoWithYtdlCore(videoUrl) {
       reject(new Error('ytdl-core: ' + (e.message || '').slice(0, 150)));
     });
   });
+}
+
+// Strategy: Piped.video proxy — fetches video through Piped's own servers (not YouTube CDN)
+// Railway requests go to pipedproxy.*, not googlevideo.com → bypasses IP ban
+const PIPED_API_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.reallyaweso.me',
+  'https://api.piped.yt',
+  'https://piped-api.privacy.com.de',
+];
+
+async function downloadVideoWithPiped(videoUrl) {
+  const vid = videoUrl.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1];
+  if (!vid) throw new Error('cannot extract video ID');
+  const errs = [];
+  for (const apiBase of PIPED_API_INSTANCES) {
+    try {
+      const infoRes = await httpGet(`${apiBase}/streams/${vid}`, 3, { Accept: 'application/json' });
+      if (infoRes.status !== 200) { errs.push(`${apiBase}: info HTTP ${infoRes.status}`); continue; }
+      let data;
+      try { data = JSON.parse(infoRes.body.toString()); } catch (_) { errs.push(`${apiBase}: bad JSON`); continue; }
+
+      // videoStreams with videoOnly:false are combined (video+audio) — no ffmpeg needed
+      const combined = (data.videoStreams || [])
+        .filter(s => s.videoOnly === false && s.mimeType?.includes('mp4') && s.url)
+        .sort((a, b) => (parseInt(a.quality) || 0) - (parseInt(b.quality) || 0));
+
+      // Prefer ≤480p; fall back to lowest available
+      const pick = combined.find(s => (parseInt(s.quality) || 0) <= 480) || combined[0];
+      if (!pick) { errs.push(`${apiBase}: no combined mp4 stream`); continue; }
+
+      // pick.url goes through pipedproxy.* — Piped's servers relay content from YouTube
+      const dl = await httpGet(pick.url);
+      if (!isVideoBuffer(dl.body)) { errs.push(`${apiBase}: not video (${dl.body.length}b ct=${dl.headers['content-type']})`); continue; }
+      if (dl.body.length > MAX_VIDEO_BYTES) { errs.push(`${apiBase}: too large ${(dl.body.length / 1e6).toFixed(1)}MB`); continue; }
+      return { buf: dl.body, source: `piped(${pick.quality})`, mime: 'video/mp4' };
+    } catch (e) { errs.push(`${apiBase}: ${(e.message || '').slice(0, 80)}`); }
+  }
+  throw new Error('piped: ' + errs.join(' | '));
 }
 
 // Invidious video — itag 18 = 360p MP4, itag 22 = 720p MP4 (may exceed size limit)
@@ -681,23 +724,27 @@ async function downloadVideo(query, videoUrl, videoId) {
 
   // 1. yt-dlp real video (works when installed)
   try { return await downloadVideoWithYtdlp(videoUrl); }
-  catch (e) { errs.push(`yt-dlp: ${(e.message || '').slice(0, 120)}`); }
+  catch (e) { errs.push(`yt-dlp: ${(e.message || '').slice(0, 100)}`); }
 
-  // 2. ytdl-core pure JS — itag 18 = 360p MP4 combined, no ffmpeg needed
+  // 2. ytdl-core pure JS — combined MP4 (video+audio), no ffmpeg needed
   try { return await downloadVideoWithYtdlCore(videoUrl); }
-  catch (e) { errs.push(`ytdl-core: ${(e.message || '').slice(0, 120)}`); }
+  catch (e) { errs.push(`ytdl-core: ${(e.message || '').slice(0, 100)}`); }
 
-  // 3. Cobalt — 'tunnel' responses go through Cobalt servers (not YouTube CDN), safe on Railway
+  // 3. Piped — requests go to Piped's own proxy servers, not YouTube CDN → no Railway IP ban
+  try { return await downloadVideoWithPiped(videoUrl); }
+  catch (e) { errs.push(`piped: ${(e.message || '').slice(0, 100)}`); }
+
+  // 4. Cobalt — 'tunnel' responses go through Cobalt servers, not YouTube CDN
   try { return await downloadVideoWithCobalt(videoUrl); }
-  catch (e) { errs.push(`cobalt: ${(e.message || '').slice(0, 120)}`); }
+  catch (e) { errs.push(`cobalt: ${(e.message || '').slice(0, 100)}`); }
 
-  // 4. Invidious proxy
+  // 5. Invidious proxy
   try { return await downloadVideoWithInvidious(videoUrl); }
-  catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 120)}`); }
+  catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 100)}`); }
 
-  // 5. Last resort: audio + static thumbnail (honest fallback)
+  // 6. Last resort: audio + static thumbnail (honest fallback)
   try { return await downloadVideoAsAudioThumb(query, videoId); }
-  catch (e) { errs.push(`audio+thumb: ${(e.message || '').slice(0, 120)}`); }
+  catch (e) { errs.push(`audio+thumb: ${(e.message || '').slice(0, 100)}`); }
 
   throw new Error(errs.join('\n'));
 }
