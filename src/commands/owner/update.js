@@ -29,14 +29,22 @@ const sessionBackup = require('../../lib/sessionBackup');
 // without persistent storage would lose the very session change that just
 // happened in the last 30 seconds.
 //
-// Two bugs fixed:
-//   1. sessionBackup.flush() could hang indefinitely if GitHub API is slow,
-//      leaving the process frozen and never calling process.exit(). Now capped
-//      at 8 seconds — if the push doesn't finish in time, we exit anyway.
-//   2. process.exit(0) (clean exit) can be treated as "completed normally" by
-//      Railway and NOT trigger the ALWAYS restart policy. Using exit code 1
-//      guarantees Railway always restarts the service.
-async function exitAfterFlush(code, ms) {
+// Design notes:
+//   - Flush is capped at 8 seconds so a slow GitHub API can never leave
+//     the process frozen. process.exit() is always called promptly.
+//   - Exit code 0 is used (not 1). Railway's ALWAYS restart policy
+//     restarts on code 0. Using exit code 1 tells Railway the process
+//     CRASHED, which triggers Railway's crash-throttle: if the service
+//     restarts and crashes again quickly (e.g. user sends .update twice),
+//     Railway's throttle kicks in and stops auto-restarting entirely.
+//   - restartScheduled prevents a second call to exitAfterFlush within
+//     the same process lifetime. Without this, sending .update twice in
+//     quick succession causes two process.exit() calls and two rapid
+//     Railway restarts, triggering the crash-throttle described above.
+let restartScheduled = false;
+async function exitAfterFlush(_code, ms) {
+  if (restartScheduled) return; // already exiting — ignore duplicate calls
+  restartScheduled = true;
   setTimeout(async () => {
     try {
       // Hard 8-second cap — flush must not block the restart indefinitely
@@ -45,10 +53,7 @@ async function exitAfterFlush(code, ms) {
         new Promise(resolve => setTimeout(resolve, 8000)),
       ]);
     } catch (_) {}
-    // Exit with 1 so Railway's ALWAYS restart policy reliably triggers.
-    // Exit code 0 ("normal completion") is sometimes treated as "done" by
-    // Railway and skipped by the restart policy even when set to ALWAYS.
-    process.exit(1);
+    process.exit(0); // Clean exit — Railway ALWAYS policy restarts on code 0
   }, ms);
 }
 
@@ -286,6 +291,7 @@ module.exports = [
         if (!r.ok) {
           return reply(`❌ Hot-update failed: ${r.message}\n\n_Try \`.redeploy\` for a full Railway rebuild instead._`);
         }
+        if (restartScheduled) return reply('♻️ Already restarting — please wait.');
         await reply(`✅ Updated ${r.touched} top-level paths${r.depSummary}.\n♻️ Restarting in 2s — session backup is being flushed before exit.`);
         // Flush the encrypted session backup to GitHub, then exit. On the
         // next start, sessionBackup.restore() pulls it back into auth_info/
@@ -301,6 +307,7 @@ module.exports = [
     name: 'restart', aliases: ['reboot'], owner,
     description: 'Restart the bot process (no code change)',
     handler: async ({ reply }) => {
+      if (restartScheduled) return reply('♻️ Already restarting — please wait.');
       await reply('🔁 Restarting in 2s — flushing session backup before exit.');
       exitAfterFlush(0, 2000);
     },
