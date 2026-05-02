@@ -84,6 +84,111 @@ module.exports = [
     },
   },
 
+  // ----- group open / close (admin-only toggle) -------------------------
+  {
+    name: 'open', aliases: ['groupopen', 'unlock'], group: true, admin: true,
+    description: 'Allow all members to send messages (remove admin-only)',
+    handler: async ({ sock, jid, reply }) => {
+      try {
+        await sock.groupSettingUpdate(jid, 'not_announcement');
+        reply('✅ Group opened — all members can now send messages.');
+      } catch (e) {
+        reply('❌ Could not open group. Make sure the bot is an admin.\n' + (e?.message || ''));
+      }
+    },
+  },
+  {
+    name: 'close', aliases: ['groupclose', 'lock'], group: true, admin: true,
+    description: 'Restrict group — only admins can send messages',
+    handler: async ({ sock, jid, reply }) => {
+      try {
+        await sock.groupSettingUpdate(jid, 'announcement');
+        reply('🔒 Group locked — only admins can send messages now.');
+      } catch (e) {
+        reply('❌ Could not lock group. Make sure the bot is an admin.\n' + (e?.message || ''));
+      }
+    },
+  },
+
+  // ----- group settings (edit info toggle) --------------------------------
+  {
+    name: 'editon', aliases: ['allowedit'], group: true, admin: true,
+    description: 'Allow all members to edit group info (name/icon/desc)',
+    handler: async ({ sock, jid, reply }) => {
+      try {
+        await sock.groupSettingUpdate(jid, 'unlocked');
+        reply('✅ All members can now edit group info.');
+      } catch (e) { reply('❌ Failed: ' + (e?.message || '')); }
+    },
+  },
+  {
+    name: 'editoff', aliases: ['disableedit'], group: true, admin: true,
+    description: 'Restrict group info editing to admins only',
+    handler: async ({ sock, jid, reply }) => {
+      try {
+        await sock.groupSettingUpdate(jid, 'locked');
+        reply('🔒 Only admins can edit group info now.');
+      } catch (e) { reply('❌ Failed: ' + (e?.message || '')); }
+    },
+  },
+
+  // ----- kick / add / promote / demote ------------------------------------
+  {
+    name: 'kick', aliases: ['remove'], group: true, admin: true,
+    description: 'Remove a member: reply to their message or @mention',
+    handler: async ({ sock, jid, m, argText, reply }) => {
+      const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]
+        || m.message?.extendedTextMessage?.contextInfo?.participant;
+      const target = mentioned || (argText.match(/\d+/)?.[0] ? argText.match(/\d+/)[0] + '@s.whatsapp.net' : null);
+      if (!target) return reply('Reply to a message or @mention the user to kick.');
+      try {
+        await sock.groupParticipantsUpdate(jid, [target], 'remove');
+        reply(`✅ @${target.split('@')[0]} removed.`, { mentions: [target] });
+      } catch (e) { reply('❌ Could not remove user: ' + (e?.message || '')); }
+    },
+  },
+  {
+    name: 'add', group: true, admin: true,
+    description: 'Add a member: .add 2567xxxxxxx',
+    handler: async ({ sock, jid, argText, reply }) => {
+      const num = argText.replace(/[^0-9]/g, '');
+      if (!num) return reply('Usage: .add 2567xxxxxxx (number with country code, no +)');
+      const target = num + '@s.whatsapp.net';
+      try {
+        const res = await sock.groupParticipantsUpdate(jid, [target], 'add');
+        const status = res?.[0]?.status;
+        if (status === '200' || status === 200) reply(`✅ +${num} added to the group.`);
+        else reply(`⚠️ Status ${status} — they may not be on WhatsApp or have privacy settings blocking adds.`);
+      } catch (e) { reply('❌ Failed: ' + (e?.message || '')); }
+    },
+  },
+  {
+    name: 'promote', aliases: ['makeadmin'], group: true, admin: true,
+    description: 'Promote a member to admin: reply or @mention',
+    handler: async ({ sock, jid, m, argText, reply }) => {
+      const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+      const target = mentioned || (argText.match(/\d+/)?.[0] ? argText.match(/\d+/)[0] + '@s.whatsapp.net' : null);
+      if (!target) return reply('Reply to or @mention the user to promote.');
+      try {
+        await sock.groupParticipantsUpdate(jid, [target], 'promote');
+        reply(`⭐ @${target.split('@')[0]} is now an admin.`, { mentions: [target] });
+      } catch (e) { reply('❌ Failed: ' + (e?.message || '')); }
+    },
+  },
+  {
+    name: 'demote', aliases: ['removeadmin'], group: true, admin: true,
+    description: 'Demote an admin to member: reply or @mention',
+    handler: async ({ sock, jid, m, argText, reply }) => {
+      const mentioned = m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+      const target = mentioned || (argText.match(/\d+/)?.[0] ? argText.match(/\d+/)[0] + '@s.whatsapp.net' : null);
+      if (!target) return reply('Reply to or @mention the user to demote.');
+      try {
+        await sock.groupParticipantsUpdate(jid, [target], 'demote');
+        reply(`🔽 @${target.split('@')[0]} demoted to member.`, { mentions: [target] });
+      } catch (e) { reply('❌ Failed: ' + (e?.message || '')); }
+    },
+  },
+
   // .rejoin <number> — adds the sender (owner) back to a group they left.
   // Requires the bot to still be a member and ideally an admin in that group.
   // The group number comes from .groups above (sorted alphabetically, stable order).
