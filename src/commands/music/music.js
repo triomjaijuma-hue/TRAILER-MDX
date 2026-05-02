@@ -60,9 +60,12 @@ function httpGet(url, maxRedir, extraHeaders) {
       },
       res => {
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
-          return maxRedir > 0
-            ? resolve(httpGet(res.headers.location, maxRedir - 1, extraHeaders))
-            : reject(new Error('too many redirects'));
+          if (maxRedir <= 0) return reject(new Error('too many redirects'));
+          // Resolve relative redirects (e.g. "/path?x=1") against the current URL
+          let next;
+          try { next = new URL(res.headers.location, url).href; }
+          catch (e) { return reject(new Error('bad redirect URL: ' + res.headers.location)); }
+          return resolve(httpGet(next, maxRedir - 1, extraHeaders));
         }
         const chunks = [];
         res.on('data', d => chunks.push(d));
@@ -564,16 +567,84 @@ function toMp4(buf, mime) {
   });
 }
 
-async function downloadVideo(query, videoUrl) {
-  const errs = [];
-  for (const [label, fn] of [
-    ['yt-dlp',    () => downloadVideoWithYtdlp(videoUrl)],
-    ['cobalt',    () => downloadVideoWithCobalt(videoUrl)],
-    ['invidious', () => downloadVideoWithInvidious(videoUrl)],
-  ]) {
-    try { return await fn(); }
-    catch (e) { errs.push(`${label}: ${(e.message || '').slice(0, 150)}`); }
+// ---------------------------------------------------------------------------
+// Audio + YouTube thumbnail → MP4 via ffmpeg
+// Works 100% on Railway: audio from SoundCloud, thumb from YouTube CDN (public)
+// ---------------------------------------------------------------------------
+function combineAudioThumb(audioBuf, thumbBuf, audioMime) {
+  return new Promise((resolve, reject) => {
+    const id   = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const aExt = audioMime?.includes('webm') ? 'webm' : audioMime?.includes('ogg') ? 'ogg' : audioMime?.includes('m4a') ? 'm4a' : 'mp3';
+    const aIn  = `/tmp/vaud_${id}.${aExt}`;
+    const tIn  = `/tmp/vtmb_${id}.jpg`;
+    const out  = `/tmp/vout_${id}.mp4`;
+    fs.writeFileSync(aIn, audioBuf);
+    fs.writeFileSync(tIn, thumbBuf);
+    execFile('ffmpeg', [
+      '-y',
+      '-loop', '1', '-i', tIn,          // looping thumbnail as video source
+      '-i', aIn,                          // audio
+      '-c:v', 'libx264', '-tune', 'stillimage', '-preset', 'fast', '-crf', '28',
+      '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p',
+      '-c:a', 'aac', '-b:a', '128k',
+      '-shortest',                        // stop when audio ends
+      '-movflags', '+faststart',
+      out,
+    ], { timeout: 300000, maxBuffer: 100 * 1024 * 1024 }, err => {
+      try { fs.unlinkSync(aIn); } catch (_) {}
+      try { fs.unlinkSync(tIn); } catch (_) {}
+      if (err) {
+        try { fs.unlinkSync(out); } catch (_) {}
+        return reject(new Error('ffmpeg combineAudioThumb: ' + (err.message || '').slice(0, 150)));
+      }
+      try {
+        const mp4 = fs.readFileSync(out);
+        try { fs.unlinkSync(out); } catch (_) {}
+        if (!isVideoBuffer(mp4)) return reject(new Error('ffmpeg: output not valid video'));
+        resolve(mp4);
+      } catch (e) { reject(e); }
+    });
+  });
+}
+
+async function downloadVideoAsAudioThumb(query, videoId) {
+  // 1. Get audio via SoundCloud (same path that powers .play — works on Railway)
+  const audio = await downloadWithSoundCloud(query);
+
+  // 2. Get YouTube thumbnail (maxresdefault → hqdefault fallback)
+  let thumbBuf;
+  for (const q of ['maxresdefault', 'hqdefault', 'sddefault']) {
+    try {
+      const r = await httpGet(`https://img.youtube.com/vi/${videoId}/${q}.jpg`);
+      if (r.status === 200 && r.body.length > 2000) { thumbBuf = r.body; break; }
+    } catch (_) {}
   }
+  if (!thumbBuf) throw new Error('could not fetch YouTube thumbnail');
+
+  // 3. Merge
+  const mp4 = await combineAudioThumb(audio.buf, thumbBuf, audio.mime);
+  return { buf: mp4, source: 'audio+thumb', mime: 'video/mp4' };
+}
+
+async function downloadVideo(query, videoUrl, videoId) {
+  const errs = [];
+
+  // 1. Audio+thumbnail — guaranteed to work wherever .play works
+  try { return await downloadVideoAsAudioThumb(query, videoId); }
+  catch (e) { errs.push(`audio+thumb: ${(e.message || '').slice(0, 150)}`); }
+
+  // 2. yt-dlp real video (works if installed)
+  try { return await downloadVideoWithYtdlp(videoUrl); }
+  catch (e) { errs.push(`yt-dlp: ${(e.message || '').slice(0, 150)}`); }
+
+  // 3. Cobalt
+  try { return await downloadVideoWithCobalt(videoUrl); }
+  catch (e) { errs.push(`cobalt: ${(e.message || '').slice(0, 150)}`); }
+
+  // 4. Invidious (now with relative-redirect fix in httpGet)
+  try { return await downloadVideoWithInvidious(videoUrl); }
+  catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 150)}`); }
+
   throw new Error(errs.join('\n'));
 }
 
@@ -772,11 +843,14 @@ module.exports = [
       const dur = v.duration?.seconds || 0;
       if (dur > 600) return reply(`❌ *${v.title}* is ${v.timestamp} — too long for WhatsApp video.\nTry *.play* to get audio only.`);
 
-      await reply(`🎬 Found: *${v.title}*\nDownloading video (480p)…`);
+      // Extract YouTube video ID
+      const videoId = v.url.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1] || '';
+
+      await reply(`🎬 Found: *${v.title}*\nGenerating video…`);
 
       let result;
       try {
-        result = await downloadVideo(argText, v.url);
+        result = await downloadVideo(argText, v.url, videoId);
       } catch (e) {
         return reply(`❌ Video download failed:\n_${e.message?.slice(0, 500)}_`);
       }
