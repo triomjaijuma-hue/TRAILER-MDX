@@ -313,4 +313,132 @@ module.exports = [
     if (!buf) return reply('Reply to an audio.');
     await sock.sendMessage(jid, { audio: buf, ptt: true, mimetype: 'audio/ogg; codecs=opus' }, { quoted: m });
   } },
+
+  // ── Uganda Jobs & Online Money ──────────────────────────────────────────
+  {
+    name: 'jobs', aliases: ['ugandajobs', 'findwork'],
+    description: 'Legit job sites & online money platforms for Uganda',
+    handler: async ({ reply }) => {
+      reply(
+`╭━━━〔 *🇺🇬 UGANDA JOBS & ONLINE EARNING* 〕━━━╮
+
+*📋 JOB SITES (Uganda & East Africa)*
+▸ *BrighterMonday UG* — brightermonday.co.ug
+  Full-time, part-time & internship jobs in UG
+
+▸ *Fuzu* — fuzu.com
+  Africa-focused jobs + free career coaching
+
+▸ *Jobline Uganda* — jobline.ug
+  Local Uganda job listings daily
+
+▸ *RecruitmentRoom* — recruitmentroom.com
+  NGO, UN & international org jobs in UG
+
+▸ *LinkedIn* — linkedin.com/jobs
+  Remote + Kampala-based professional jobs
+
+▸ *NGO Jobs Uganda* — ngojobsuganda.com
+  NGO, INGO & development sector vacancies
+
+▸ *UgandaJobs.net* — ugandajobs.net
+  Government, private & contract roles
+
+━━━━━━━━━━━━━━━━━━━━━━
+
+*💻 MAKE MONEY ONLINE (Legit, Pays to MTN/Airtel)*
+▸ *Upwork* — upwork.com
+  Freelance writing, design, coding, VA work
+  💰 Pays via Payoneer → Mobile Money
+
+▸ *Fiverr* — fiverr.com
+  Sell any skill from UGX 18,000 ($5) upward
+  💰 Payoneer → Mobile Money
+
+▸ *Toptal* — toptal.com
+  Premium remote jobs (developers, designers)
+
+▸ *Remotasks* — remotasks.com
+  AI training tasks — pays weekly via PayPal
+
+▸ *Appen* — appen.com
+  Data labeling & search evaluation tasks
+
+▸ *Microworkers* — microworkers.com
+  Small tasks, quick payment via Payoneer
+
+▸ *Rev.com* — rev.com
+  Transcription & captioning — paid per minute
+
+▸ *2Stallions / Andela* — andela.com
+  Tech jobs specifically for African developers
+
+━━━━━━━━━━━━━━━━━━━━━━
+
+*📱 LOCAL ONLINE EARNING (Uganda)*
+▸ *Jumia Selling* — jumia.ug/seller
+  Sell products on Uganda's biggest marketplace
+
+▸ *Glovo / SafeBoda Food* — Delivery rider work
+  Sign up at glovoapp.com or safeboda.com
+
+▸ *Uber Driver* — uber.com/ug/en/drive
+  Drive with Uber in Kampala
+
+▸ *Kenya & UG Facebook Groups*
+  Search: "Remote Jobs Uganda", "Online Jobs East Africa"
+
+━━━━━━━━━━━━━━━━━━━━━━
+
+*💡 TIP:* Use Payoneer (free signup) to receive
+international payments → withdraw to MTN/Airtel Money.
+Sign up: payoneer.com
+
+╰━━━〔 *TRAILER-MDX* 〕━━━╯`
+      );
+    },
+  },
+  {
+    name: 'freelance', aliases: ['makemoney', 'earnonline'],
+    description: 'Quick guide to start freelancing from Uganda',
+    handler: async ({ reply }) => {
+      reply(
+`╭━━━〔 *💰 START FREELANCING FROM UGANDA* 〕━━━╮
+
+*STEP 1 — Pick a skill to sell:*
+• Graphic Design (Canva, Photoshop)
+• Copywriting / Article Writing
+• Video Editing (CapCut, Premiere)
+• Social Media Management
+• Data Entry / Virtual Assistant
+• Web/App Development
+
+*STEP 2 — Create free accounts on:*
+• fiverr.com (beginners — easiest)
+• upwork.com (higher paying)
+• freelancer.com (many small tasks)
+
+*STEP 3 — Set up payments:*
+• Payoneer (payoneer.com) — FREE
+  Links to MTN/Airtel Money
+• Wise (wise.com) — also works
+• PayPal accepted on some platforms
+
+*STEP 4 — Get your first client:*
+• Do 1-2 jobs FREE or very cheap
+• Get 5-star reviews
+• Raise your price gradually
+
+*📊 Realistic monthly earnings:*
+• Beginner: UGX 200k–600k
+• Intermediate: UGX 600k–2M
+• Experienced: UGX 2M–10M+
+
+*🔗 Helpful Uganda freelancer groups:*
+Search Facebook: "Ugandan Freelancers Network"
+
+╰━━━〔 *TRAILER-MDX* 〕━━━╯`
+      );
+    },
+  },
 ];
