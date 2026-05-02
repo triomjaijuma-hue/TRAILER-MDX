@@ -137,8 +137,10 @@ async function refresh() {
     const r = await fetch('/api/status').then(r => r.json());
     $('statusText').textContent = r.connected
       ? 'Bot is online — ' + (r.botNumber ? '+' + r.botNumber : 'connected')
-      : (r.hasSession ? 'Session found — reconnecting…' : 'Not paired yet — paste your number below.');
-    $('dot').className = 'dot ' + (r.connected ? 'ok' : (r.hasSession ? '' : 'err'));
+      : (r.loggedOut
+          ? 'Logged out — enter your number and get a new pairing code.'
+          : (r.hasSession ? 'Session found — reconnecting…' : 'Not paired yet — paste your number below.'));
+    $('dot').className = 'dot ' + (r.connected ? 'ok' : (r.loggedOut ? 'err' : (r.hasSession ? '' : 'err')));
     if (!$('num').value && r.botNumber) $('num').placeholder = r.botNumber;
   } catch (e) {
     $('statusText').textContent = 'Could not reach the bot service.';

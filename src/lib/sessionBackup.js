@@ -206,4 +206,26 @@ async function flush() {
   await pushNow();
 }
 
-module.exports = { restore, schedule, flush, pushNow, isEnabled };
+
+// Delete the remote backup — called when WhatsApp sends 401 (logged out) or
+// when the user clicks Logout, so a stale backup cannot be restored on restart.
+async function clearRemote() {
+  if (!isEnabled()) return;
+  try {
+    const file = await ghGet();
+    if (!file) { lastHash = null; return; } // already gone
+    const url = `https://api.github.com/repos/${REPO}/contents/${encodeURIComponent(REMOTE).replace(/%2F/g, '/')}`;
+    await axios.delete(url, {
+      headers: { Authorization: `token ${TOKEN}`, 'User-Agent': UA, 'Content-Type': 'application/json' },
+      data: { message: 'chore: clear stale session after logout', sha: file.sha, branch: BRANCH },
+      timeout: 20000,
+      validateStatus: () => true,
+    });
+    lastHash = null; // reset so the next push isn't skipped as "unchanged"
+    logger.info('sessionBackup: remote backup cleared after logout.');
+  } catch (e) {
+    logger.warn({ err: e?.message }, 'sessionBackup.clearRemote failed (non-fatal)');
+  }
+}
+
+module.exports = { restore, schedule, flush, pushNow, isEnabled, clearRemote };

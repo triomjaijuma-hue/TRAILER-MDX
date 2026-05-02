@@ -33,6 +33,7 @@ function start(bot) {
       botNumber: config.botNumber,
       connected: bot.isConnected(),
       hasSession: bot.hasSession(),
+      loggedOut: bot.isLoggedOut ? bot.isLoggedOut() : false,
       uptime: process.uptime(),
     });
   });

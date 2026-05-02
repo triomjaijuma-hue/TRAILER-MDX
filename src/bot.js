@@ -22,6 +22,7 @@ const sessionBackup = require('./lib/sessionBackup');
 let sock = null;
 let connected = false;
 let lastPairCode = null;
+let loggedOut    = false;
 let pendingPairNumber = null;
 let avatarApplied = false;
 
@@ -240,8 +241,10 @@ async function start() {
         sock = null;
         lastPairCode = null;
         avatarApplied = false;
+        loggedOut = true;
         try { fs.rmSync(config.paths.auth, { recursive: true, force: true }); } catch (_) {}
         fs.mkdirSync(config.paths.auth, { recursive: true });
+        sessionBackup.clearRemote().catch(() => {});
         logger.info('Session cleared after logout — open the pairing page to link again.');
       }
     }
@@ -508,6 +511,7 @@ async function requestPairing(number) {
     throw new Error('Bot is already paired and connected. Use "Logout" first if you want a fresh code.');
   }
   lastPairCode = null;
+  loggedOut = false;
   pendingPairNumber = number;
 
   if (!sock) {
@@ -544,8 +548,10 @@ async function logout() {
   fs.mkdirSync(config.paths.auth, { recursive: true });
   connected = false;
   avatarApplied = false;
+  loggedOut = true;
   sock = null;
   lastPairCode = null;
+  sessionBackup.clearRemote().catch(() => {});
   setTimeout(() => start().catch(() => {}), 1000);
 }
 
@@ -555,5 +561,6 @@ module.exports = {
   logout,
   hasSession,
   isConnected: () => connected,
+  isLoggedOut: () => loggedOut,
   getSocket: () => sock,
 };
