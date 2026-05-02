@@ -10,7 +10,7 @@ function kampalaTime() {
 const CAT_ICON = {
   OWNER: '👑', AI: '🤖', DOWNLOAD: '📥', GENERAL: '📌', UTILITY: '🛠️',
   MENU: '📂', ADMIN: '🛡️', STICKERS: '🎴', TOOLS: '🧰', GROUP: '👥',
-  IMAGES: '🖼️', GAMES: '🎮', SEARCH: '🔎', FUN: '🎉', STALK: '🕵️',
+  IMAGES: '🌺', GAMES: '🎮', SEARCH: '🔎', FUN: '🎉', STALK: '🕵️',
   INFO: 'ℹ️', QUOTES: '💬', MUSIC: '🎵', UPLOAD: '☁️',
   ANIME: '🌸', AUDIOFX: '🎶', NOTES: '📝', PRIVACY: '🔒',
   TEXT: '✏️', EPHOTO: '🎨',
@@ -22,6 +22,13 @@ const ORDER = [
   'STALK','INFO','QUOTES','MUSIC','UPLOAD','NOTES','PRIVACY','TEXT','EPHOTO',
 ];
 
+const FLOWER_BANNER = '🌺🌸🌼🌻🌷🌹🌺🌸🌼🌻🌷🌹🌺🌸🌼🌻';
+
+function catBar(cat) {
+  const icon = CAT_ICON[cat] || '🌼';
+  return `🌸━━━━━━ ${icon} *${cat}* ${icon} ━━━━━━🌸`;
+}
+
 function fmt(handler) {
   const cats  = handler.getCategories();
   const total = handler.getCommands().size;
@@ -29,30 +36,32 @@ function fmt(handler) {
 
   const lines = [];
 
-  // ── Header ──────────────────────────────────────────────────────────────
-  lines.push('\u2726\u2550\u2550\u2550 *TRAILER MENU* \u2550\u2550\u2550\u2726');
-  lines.push(`\u25B8 Bot: *${config.botName}*`);
-  lines.push(`\u25B8 Prefixes: *${config.prefixes.join('  ')}*`);
-  lines.push(`\u25B8 Plugins: *${Math.max(total, 267)}*`);
-  lines.push(`\u25B8 Version: *${config.version}*`);
-  lines.push(`\u25B8 Time: *${time}*`);
-  lines.push('\u2726\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2726');
+  // ── Decorative top banner ────────────────────────────────────────────────
+  lines.push(FLOWER_BANNER);
+  lines.push('');
+  lines.push('  ✦═══ *TRAILER MENU* ═══✦');
+  lines.push(`  🌸 Bot      : *${config.botName}*`);
+  lines.push(`  🌸 Prefixes : *${config.prefixes.join('  ')}*`);
+  lines.push(`  🌸 Plugins  : *${Math.max(total, 267)}*`);
+  lines.push(`  🌸 Version  : *${config.version}*`);
+  lines.push(`  🌸 Time     : *${time}*`);
+  lines.push('');
+  lines.push(FLOWER_BANNER);
   lines.push('');
 
   // ── Category sections ────────────────────────────────────────────────────
   for (const cat of ORDER) {
     const list = cats[cat];
     if (!list || list.length === 0) continue;
-    const icon = CAT_ICON[cat] || '\u2728';
-    lines.push(`\u2550\u2550\u2550 ${icon} *${cat}* ${icon} \u2550\u2550\u2550`);
-    for (const n of list) lines.push(`  \u25BA *.${n}*`);
+    lines.push(catBar(cat));
+    for (const n of list) lines.push(`  🌼 *.${n}*`);
     lines.push('');
   }
 
   // ── Footer ───────────────────────────────────────────────────────────────
-  lines.push('\u2726\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2726');
-  lines.push('  \u2139\uFE0F *Type .help <cmd> for details*');
-  lines.push('\u2726\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2726');
+  lines.push(FLOWER_BANNER);
+  lines.push('  💐 *Type .help <cmd> for details*');
+  lines.push(FLOWER_BANNER);
 
   return lines.join('\n');
 }
@@ -60,15 +69,17 @@ function fmt(handler) {
 function fmtCompact(handler) {
   const cats  = handler.getCategories();
   const lines = [];
-  lines.push('\u2726\u2550\u2550\u2550 *TRAILER MENU* \u2550\u2550\u2550\u2726');
+  lines.push(FLOWER_BANNER);
+  lines.push('  ✦═══ *TRAILER MENU* ═══✦');
   lines.push('');
   for (const k of ORDER) {
     if (!cats[k] || cats[k].length === 0) continue;
-    const icon = CAT_ICON[k] || '\u2728';
-    lines.push(`${icon} *${k}* \u2014 ${cats[k].length} cmds`);
+    const icon = CAT_ICON[k] || '🌼';
+    lines.push(`${icon} *${k}* — ${cats[k].length} cmds`);
   }
   lines.push('');
-  lines.push('\u25B8 Use *.menu* for the full list');
+  lines.push('🌸 Use *.menu* for the full list 🌸');
+  lines.push(FLOWER_BANNER);
   return lines.join('\n');
 }
 
@@ -96,10 +107,11 @@ module.exports = [
     handler: async ({ reply }) => {
       const handler = require('../../handler');
       const names = [...handler.getCommands().keys()].sort();
-      const lines = ['\u2726\u2550\u2550\u2550 *All Commands* \u2550\u2550\u2550\u2726', ''];
-      names.forEach(n => lines.push(`  \u25BA .${n}`));
+      const lines = [FLOWER_BANNER, '  🌺 *All Loaded Commands* 🌺', ''];
+      names.forEach(n => lines.push(`  🌼 .${n}`));
       lines.push('');
-      lines.push(`\u25B8 *${names.length} commands loaded*`);
+      lines.push(`🌸 *${names.length} commands total* 🌸`);
+      lines.push(FLOWER_BANNER);
       await reply(lines.join('\n'));
     },
   },
