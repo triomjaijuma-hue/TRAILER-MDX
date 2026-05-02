@@ -217,32 +217,48 @@ async function getYtdlp() {
   }
 
   // 5. Self-download yt-dlp binary from GitHub releases (~10 sec once per container boot)
+  //    Try app dir first (/app/bin/yt-dlp) — /tmp may be noexec in some Railway containers.
+  //    /var/tmp is a common noexec-safe alternative. /tmp is last resort.
   try {
-    const autoBin = '/tmp/yt-dlp';
-    let needDl = true;
-    try { if (fs.statSync(autoBin).size > 1_000_000) needDl = false; } catch (_) {}
-    if (needDl) {
-      const buf = await new Promise((resolve, reject) => {
-        function get(url, hops) {
-          if (hops > 5) return reject(new Error('too many redirects'));
-          const mod = url.startsWith('https') ? https : http;
-          mod.get(url, { headers: { 'User-Agent': 'yt-dlp-autoinstall' }, timeout: 60000 }, (r) => {
-            if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location)
-              return get(r.headers.location, hops + 1);
-            if (r.statusCode !== 200) { r.resume(); return reject(new Error('HTTP ' + r.statusCode)); }
-            const chunks = [];
-            r.on('data', c => chunks.push(c));
-            r.on('end', () => resolve(Buffer.concat(chunks)));
-            r.on('error', reject);
-          }).on('error', reject);
+    const dlCandidates = [
+      path.join(process.cwd(), 'bin', 'yt-dlp'), // /app/bin/yt-dlp — writable + executable
+      '/var/tmp/yt-dlp',                           // often exec-allowed unlike /tmp
+      '/tmp/yt-dlp',                               // fallback
+    ];
+    let gotBin = null;
+    for (const autoBin of dlCandidates) {
+      try {
+        let needDl = true;
+        try { if (fs.statSync(autoBin).size > 1_000_000) needDl = false; } catch (_) {}
+        if (needDl) {
+          fs.mkdirSync(path.dirname(autoBin), { recursive: true });
+          const buf = await new Promise((resolve, reject) => {
+            function get(url, hops) {
+              if (hops > 5) return reject(new Error('too many redirects'));
+              const mod = url.startsWith('https') ? https : http;
+              mod.get(url, { headers: { 'User-Agent': 'yt-dlp-autoinstall' }, timeout: 90000 }, (r) => {
+                if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location)
+                  return get(r.headers.location, hops + 1);
+                if (r.statusCode !== 200) { r.resume(); return reject(new Error('HTTP ' + r.statusCode)); }
+                const chunks = [];
+                r.on('data', c => chunks.push(c));
+                r.on('end', () => resolve(Buffer.concat(chunks)));
+                r.on('error', reject);
+              }).on('error', reject);
+            }
+            get('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp', 0);
+          });
+          fs.writeFileSync(autoBin, buf);
+          fs.chmodSync(autoBin, 0o755);
         }
-        get('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp', 0);
-      });
-      fs.writeFileSync(autoBin, buf);
-      fs.chmodSync(autoBin, 0o755);
+        if (await testCmd(autoBin, ['--version'])) {
+          gotBin = autoBin;
+          break;
+        }
+      } catch (_) {}
     }
-    if (await testCmd(autoBin, ['--version'])) {
-      _ytdlp = { bin: autoBin, prefix: [] };
+    if (gotBin) {
+      _ytdlp = { bin: gotBin, prefix: [] };
       return _ytdlp;
     }
   } catch (_) {}
@@ -531,15 +547,15 @@ async function downloadWithSoundCloudYtdlp(query) {
 // ---------------------------------------------------------------------------
 // Wide instance pool — different IPs behave differently from Railway vs Replit
 // Testing from Replit does NOT predict Railway behaviour, so keep them all
+// Invidious instances — tested May 2026. Most block cloud IPs (403/502/shutdown).
+// Keeping all that ever responded; Railway IPs may differ from Replit IPs.
 const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',          // Reliable — NZ-based, low latency
-  'https://invidious.io.lol',        // Good uptime
-  'https://yewtu.be',                // NL-based, long-running
-  'https://invidious.lunar.icu',     // EU-based
-  'https://iv.datura.network',       // Active community instance
-  'https://invidious.perennialte.ch', // CH-based
-  'https://invidious.nerdvpn.de',    // DE-based
-  'https://inv.thepixora.com',       // Backup
+  'https://invidious.slipfox.xyz',       // 200 from Replit — may work from Railway
+  'https://inv.nadeko.net',              // 403 from Replit — sometimes open from other IPs
+  'https://yewtu.be',                    // 403 from Replit — NL-based, high traffic
+  'https://invidious.perennialte.ch',    // CH-based
+  'https://invidious.nerdvpn.de',        // DE-based
+  'https://inv.thepixora.com',           // Backup
 ];
 
 async function downloadWithInvidious(videoUrl) {
@@ -569,12 +585,11 @@ async function downloadWithInvidious(videoUrl) {
 // ---------------------------------------------------------------------------
 // Strategy 4: Cobalt
 // ---------------------------------------------------------------------------
+// Cobalt instances — tested May 2026. Most community instances are DNS-dead.
+// api.cobalt.tools now requires JWT auth. Keeping for future recovery.
 const COBALT_INSTANCES = [
-  'https://cobalt.zt.ag',                    // Community — reliable
-  'https://dl.cgm.rs',                       // Community — RS-based
-  'https://cobalt.lunar.icu',               // Community — EU
-  'https://cobalt.api.timelessnesses.me',   // Community backup
-  'https://api.cobalt.tools',               // Official — may rate-limit
+  'https://cobalt.api.timelessnesses.me',   // Self-signed SSL — may work in prod
+  'https://api.cobalt.tools',               // Official — requires JWT auth since 2025
 ];
 
 async function downloadWithCobalt(videoUrl) {
@@ -736,12 +751,13 @@ async function downloadVideoWithYtdlCore(videoUrl) {
 
 // Strategy: Piped.video proxy — fetches video through Piped's own servers (not YouTube CDN)
 // Railway requests go to pipedproxy.*, not googlevideo.com → bypasses IP ban
+// Piped instances — tested May 2026
+// piped.in.projectsegfau.lt: 200 — primary working instance
 const PIPED_API_INSTANCES = [
-  'https://api.piped.yt',
-  'https://piped-api.privacy.com.de',
-  'https://watchapi.whatever.social',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.kavin.rocks',
+  'https://piped.in.projectsegfau.lt',     // 200 confirmed working
+  'https://api.piped.projectsegfau.lt',    // same project, alt endpoint
+  'https://pipedapi.kavin.rocks',          // original Kavin instance
+  'https://watchapi.whatever.social',      // backup
 ];
 
 async function downloadVideoWithPiped(videoUrl) {
@@ -974,6 +990,8 @@ async function downloadVideo(query, videoUrl, videoId) {
   try { return await downloadVideoAsAudioThumb(query, videoId); }
   catch (e) { errs.push(`audio+thumb: ${(e.message || '').slice(0, 100)}`); }
 
+  // Add actionable hint to the error
+  errs.push('\n💡 FIX: Trigger a Railway redeploy to install yt-dlp, then send .ytcookies with YouTube cookies for best results.');
   throw new Error(errs.join('\n'));
 }
 
