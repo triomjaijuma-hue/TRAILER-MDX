@@ -146,6 +146,16 @@ module.exports = [
       [ogg, `/tmp/tts_${id}_in.mp3`, `/tmp/tts_${id}_in.wav`].forEach(f => { try { fs.unlinkSync(f); } catch (_) {} });
     }
 
+    // Validate that a buffer is actually MP3 audio (not HTML/JSON error pages).
+    // Blank voice notes happen when fake "200 OK" responses (captcha/block pages)
+    // pass a size-only check and get fed to ffmpeg, which outputs a silent OGG.
+    function isValidMp3(buf) {
+      if (!buf || buf.length < 1024) return false;
+      // ID3 tag header (MP3 with metadata) OR raw MPEG sync word
+      return (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) ||
+             (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0);
+    }
+
     // Convert any audio buffer (mp3/wav) → OGG Opus so WhatsApp plays it as a voice note
     function toOgg(inputBuf, ext) {
       return new Promise((resolve, reject) => {
@@ -158,39 +168,17 @@ module.exports = [
           (err, _o, se) => {
             try { fs.unlinkSync(inp); } catch (_) {}
             if (err) return reject(new Error('ffmpeg: ' + (se || err.message).slice(0, 200)));
-            if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 50)
-              return reject(new Error('ffmpeg: empty output'));
+            if (!fs.existsSync(ogg) || fs.statSync(ogg).size < 500)
+              return reject(new Error('ffmpeg: output too small — likely silent'));
             resolve(fs.readFileSync(ogg));
           }
         );
       });
     }
 
-    // Provider 0: StreamElements TTS — free, no key, works from cloud/Railway IPs
-    function streamElementsTTS() {
-      return new Promise((resolve, reject) => {
-        const voice = 'Brian';
-        const url = `https://api.streamelements.com/kappa/v2/speech?voice=${voice}&text=${encodeURIComponent(text)}`;
-        const p = new URL(url);
-        https.get(
-          { hostname: p.hostname, path: p.pathname + p.search,
-            headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 },
-          res => {
-            if (res.statusCode !== 200)
-              return reject(new Error(`StreamElements TTS: HTTP ${res.statusCode}`));
-            const chunks = [];
-            res.on('data', d => chunks.push(d));
-            res.on('end', () => {
-              const buf = Buffer.concat(chunks);
-              if (buf.length < 512) return reject(new Error('StreamElements TTS: empty response'));
-              resolve(buf);
-            });
-          }
-        ).on('error', reject);
-      });
-    }
-
-    // Provider 1: Google Translate TTS — unofficial but very reliable, no API key needed
+    // Provider 0: Google Translate TTS — free, no API key, works from cloud IPs.
+    // Uses magic-byte validation so HTML captcha/block pages (which return HTTP 200
+    // but aren't audio) are rejected before they can reach ffmpeg and cause silent OGGs.
     function googleTTS(lang) {
       lang = lang || 'en';
       return new Promise((resolve, reject) => {
@@ -198,31 +186,55 @@ module.exports = [
           `https://translate.google.com/translate_tts` +
           `?ie=UTF-8&q=${encodeURIComponent(text)}&tl=${lang}&client=tw-ob&ttsspeed=1`;
         const p = new URL(url);
-        https.get(
+        const req = https.get(
           {
             hostname: p.hostname,
             path: p.pathname + p.search,
             headers: {
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
               Referer: 'https://translate.google.com/',
+              'Accept': 'audio/mpeg, audio/*;q=0.9, */*;q=0.8',
             },
+            timeout: 15000,
           },
           res => {
-            if (res.statusCode !== 200)
-              return reject(new Error(`Google TTS: HTTP ${res.statusCode}`));
-            const chunks = [];
-            res.on('data', d => chunks.push(d));
-            res.on('end', () => {
-              const buf = Buffer.concat(chunks);
-              if (buf.length < 512) return reject(new Error('Google TTS: empty response'));
-              resolve(buf);
-            });
+            // Follow one redirect level (Google sometimes redirects on cloud IPs)
+            if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+              const location = res.headers.location;
+              if (!location) return reject(new Error(`Google TTS: redirect with no Location`));
+              res.resume();
+              const rp = new URL(location);
+              https.get(
+                { hostname: rp.hostname, path: rp.pathname + rp.search,
+                  headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'audio/mpeg, audio/*' }, timeout: 15000 },
+                res2 => { collectAndValidate(res2, resolve, reject, 'Google TTS (redirected)'); }
+              ).on('error', reject);
+              return;
+            }
+            collectAndValidate(res, resolve, reject, 'Google TTS');
           }
-        ).on('error', reject);
+        );
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(new Error('Google TTS: request timed out')); });
+
+        function collectAndValidate(res, resolve, reject, label) {
+          if (res.statusCode !== 200)
+            return reject(new Error(`${label}: HTTP ${res.statusCode}`));
+          const chunks = [];
+          res.on('data', d => chunks.push(d));
+          res.on('end', () => {
+            const buf = Buffer.concat(chunks);
+            if (!isValidMp3(buf))
+              return reject(new Error(`${label}: response is not valid MP3 (got ${buf.length}B, starts: ${buf.slice(0,4).toString('hex')})`));
+            resolve(buf);
+          });
+          res.on('error', reject);
+        }
       });
     }
 
-    // Provider 2: espeak-ng / espeak offline binary
+    // Provider 1: espeak-ng offline binary — always available in the Docker image,
+    // no network required, never returns blank audio.
     function espeakTTS() {
       return new Promise((resolve, reject) => {
         const candidates = [
@@ -249,8 +261,11 @@ module.exports = [
       const wav = `/tmp/tts_${id}.wav`;
       execFile(bin, ['-v', 'en', '-s', '145', '-p', '50', text, '-w', wav], { timeout: 15000 }, (err, _o, se) => {
         if (err) return reject(new Error((se || err.message).slice(0, 200)));
+        if (!fs.existsSync(wav)) return reject(new Error('espeak: output file missing'));
         const buf = fs.readFileSync(wav);
         try { fs.unlinkSync(wav); } catch (_) {}
+        // WAV must have at least a 44-byte header + real audio frames; < 1 KB means silence/empty
+        if (buf.length < 1024) return reject(new Error(`espeak: WAV too small (${buf.length}B) — likely no audio`));
         resolve(buf);
       });
     }
@@ -258,15 +273,11 @@ module.exports = [
     try {
       let audioBuf, ext;
 
-      // Try StreamElements first — cloud-IP friendly, no key, reliable
-      try { audioBuf = await streamElementsTTS(); ext = 'mp3'; }
-      catch (_) {
-        // Fallback: Google Translate TTS
-        try { audioBuf = await googleTTS('en'); ext = 'mp3'; }
-        catch (_2) {
-          // Final fallback: offline espeak binary (always available in Docker image)
-          audioBuf = await espeakTTS(); ext = 'wav';
-        }
+      // Provider 0: Google TTS (network) with magic-byte validation
+      try { audioBuf = await googleTTS('en'); ext = 'mp3'; }
+      catch (_googleErr) {
+        // Provider 1: espeak-ng (offline, always works, robotic voice)
+        audioBuf = await espeakTTS(); ext = 'wav';
       }
 
       const oggBuf = await toOgg(audioBuf, ext);
