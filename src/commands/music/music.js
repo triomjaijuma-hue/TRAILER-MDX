@@ -369,13 +369,19 @@ async function downloadWithSoundCloud(query) {
 // ---------------------------------------------------------------------------
 // Strategy 3: Invidious  — video-id-based audio proxy
 // ---------------------------------------------------------------------------
-// TRUE PROXY instances only — tested without -L flag (200 = server fetches & serves itself)
-// 301/302 instances redirect to YouTube CDN which blocks Railway IPs — do NOT add those back
+// Wide instance pool — different IPs behave differently from Railway vs Replit
+// Testing from Replit does NOT predict Railway behaviour, so keep them all
 const INVIDIOUS_INSTANCES = [
-  'https://invidious.nerdvpn.de',       // 200 ✅ true proxy
-  'https://invidious.projectsegfau.lt', // 200 ✅ true proxy
-  'https://invidious.slipfox.xyz',      // 200 ✅ true proxy
-  'https://inv.in.projectsegfau.lt',    // 200 ✅ true proxy
+  'https://inv.thepixora.com',           // worked for Despacito on Railway
+  'https://invidious.nerdvpn.de',
+  'https://invidious.projectsegfau.lt',
+  'https://invidious.slipfox.xyz',
+  'https://inv.in.projectsegfau.lt',
+  'https://inv.nadeko.net',
+  'https://invidious.privacyredirect.com',
+  'https://iv.ggtyler.dev',
+  'https://yewtu.be',
+  'https://invidious.io.lol',
 ];
 
 async function downloadWithInvidious(videoUrl) {
