@@ -9,6 +9,6 @@
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 100,
     "healthcheckPath": "/healthz",
-    "healthcheckTimeout": 60
+    "healthcheckTimeout": 300
   }
 }
