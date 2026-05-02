@@ -405,7 +405,14 @@ async function downloadWithInvidious(videoUrl) {
 // ---------------------------------------------------------------------------
 // Strategy 4: Cobalt
 // ---------------------------------------------------------------------------
-const COBALT_INSTANCES = ['https://api.cobalt.tools', 'https://cobalt.catvibers.me'];
+const COBALT_INSTANCES = [
+  'https://api.cobalt.tools',
+  'https://cobalt.catvibers.me',
+  'https://cobalt.zt.ag',
+  'https://dl.cgm.rs',
+  'https://cobalt.lunar.icu',
+  'https://cobalt.api.timelessnesses.me',
+];
 
 async function downloadWithCobalt(videoUrl) {
   for (const base of COBALT_INSTANCES) {
@@ -483,6 +490,7 @@ async function downloadVideoWithYtdlp(videoUrl) {
 }
 
 async function downloadVideoWithCobalt(videoUrl) {
+  const errs = [];
   for (const base of COBALT_INSTANCES) {
     try {
       const body = JSON.stringify({
@@ -494,24 +502,66 @@ async function downloadVideoWithCobalt(videoUrl) {
       const p = new URL(base);
       const res = await new Promise((resolve, reject) => {
         const req = https.request(
-          { hostname: p.hostname, path: p.pathname || '/', method: 'POST',
+          { hostname: p.hostname, path: '/', method: 'POST',
             headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', 'Content-Length': Buffer.byteLength(body) } },
           resp => { const c = []; resp.on('data', d => c.push(d)); resp.on('end', () => resolve({ status: resp.statusCode, body: Buffer.concat(c).toString() })); }
         );
         req.on('error', reject);
-        req.setTimeout(25000, () => req.destroy(new Error('timeout')));
+        req.setTimeout(30000, () => req.destroy(new Error('timeout')));
         req.write(body); req.end();
       });
-      if (res.status !== 200) continue;
-      const data = JSON.parse(res.body);
-      if (!['tunnel', 'redirect', 'stream'].includes(data.status) || !data.url) continue;
+      if (res.status !== 200) { errs.push(`${p.hostname}: HTTP ${res.status}`); continue; }
+      let data;
+      try { data = JSON.parse(res.body); } catch (_) { errs.push(`${p.hostname}: bad JSON`); continue; }
+      // status 'tunnel' = Cobalt serves from its own server (cloud-IP safe)
+      // status 'redirect' = direct YouTube CDN (may be blocked on Railway)
+      if (!data.url) { errs.push(`${p.hostname}: ${data.status || 'no url'} ${data.error?.code || ''}`); continue; }
       const dl = await httpGet(data.url);
-      if (!isVideoBuffer(dl.body)) continue;
-      if (dl.body.length > MAX_VIDEO_BYTES) continue;
+      if (!isVideoBuffer(dl.body)) { errs.push(`${p.hostname}: not video (${dl.body.length}b)`); continue; }
+      if (dl.body.length > MAX_VIDEO_BYTES) { errs.push(`${p.hostname}: too large`); continue; }
       return { buf: dl.body, source: `cobalt(${p.hostname})`, mime: 'video/mp4' };
-    } catch (_) {}
+    } catch (e) { errs.push(`${new URL(base).hostname}: ${(e.message || '').slice(0, 60)}`); }
   }
-  throw new Error('cobalt video: all instances failed');
+  throw new Error('cobalt: ' + errs.join(' | '));
+}
+
+// Strategy: @distube/ytdl-core — pure JS, itag 18 = 360p MP4 combined (video+audio, no ffmpeg needed)
+async function downloadVideoWithYtdlCore(videoUrl) {
+  const ytdl = require('@distube/ytdl-core');
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const chunks = [];
+    let totalBytes = 0;
+    const timer = setTimeout(() => { if (!done) { done = true; stream.destroy(); reject(new Error('ytdl-core: timeout after 120s')); } }, 120000);
+    let stream;
+    try {
+      stream = ytdl(videoUrl, {
+        quality: 18,  // 360p MP4, combined video+audio — works without ffmpeg
+        requestOptions: { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } },
+      });
+    } catch (e) { clearTimeout(timer); return reject(new Error('ytdl-core init: ' + (e.message || '').slice(0, 100))); }
+    stream.on('data', chunk => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_VIDEO_BYTES) {
+        done = true; stream.destroy();
+        clearTimeout(timer);
+        return reject(new Error(`ytdl-core: file exceeds ${MAX_VIDEO_BYTES / 1e6} MB`));
+      }
+      chunks.push(chunk);
+    });
+    stream.on('end', () => {
+      if (done) return;
+      done = true; clearTimeout(timer);
+      const buf = Buffer.concat(chunks);
+      if (!isVideoBuffer(buf)) return reject(new Error(`ytdl-core: not valid video (${buf.length}b)`));
+      resolve({ buf, source: 'ytdl-core(360p)', mime: 'video/mp4' });
+    });
+    stream.on('error', e => {
+      if (done) return;
+      done = true; clearTimeout(timer);
+      reject(new Error('ytdl-core: ' + (e.message || '').slice(0, 150)));
+    });
+  });
 }
 
 // Invidious video — itag 18 = 360p MP4, itag 22 = 720p MP4 (may exceed size limit)
@@ -629,21 +679,25 @@ async function downloadVideoAsAudioThumb(query, videoId) {
 async function downloadVideo(query, videoUrl, videoId) {
   const errs = [];
 
-  // 1. Audio+thumbnail — guaranteed to work wherever .play works
-  try { return await downloadVideoAsAudioThumb(query, videoId); }
-  catch (e) { errs.push(`audio+thumb: ${(e.message || '').slice(0, 150)}`); }
-
-  // 2. yt-dlp real video (works if installed)
+  // 1. yt-dlp real video (works when installed)
   try { return await downloadVideoWithYtdlp(videoUrl); }
-  catch (e) { errs.push(`yt-dlp: ${(e.message || '').slice(0, 150)}`); }
+  catch (e) { errs.push(`yt-dlp: ${(e.message || '').slice(0, 120)}`); }
 
-  // 3. Cobalt
+  // 2. ytdl-core pure JS — itag 18 = 360p MP4 combined, no ffmpeg needed
+  try { return await downloadVideoWithYtdlCore(videoUrl); }
+  catch (e) { errs.push(`ytdl-core: ${(e.message || '').slice(0, 120)}`); }
+
+  // 3. Cobalt — 'tunnel' responses go through Cobalt servers (not YouTube CDN), safe on Railway
   try { return await downloadVideoWithCobalt(videoUrl); }
-  catch (e) { errs.push(`cobalt: ${(e.message || '').slice(0, 150)}`); }
+  catch (e) { errs.push(`cobalt: ${(e.message || '').slice(0, 120)}`); }
 
-  // 4. Invidious (now with relative-redirect fix in httpGet)
+  // 4. Invidious proxy
   try { return await downloadVideoWithInvidious(videoUrl); }
-  catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 150)}`); }
+  catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 120)}`); }
+
+  // 5. Last resort: audio + static thumbnail (honest fallback)
+  try { return await downloadVideoAsAudioThumb(query, videoId); }
+  catch (e) { errs.push(`audio+thumb: ${(e.message || '').slice(0, 120)}`); }
 
   throw new Error(errs.join('\n'));
 }
@@ -869,7 +923,7 @@ module.exports = [
 
       await sock.sendMessage(
         jid,
-        { video: buf, mimetype: 'video/mp4', caption: `🎬 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}\n_via ${source}_` },
+        { video: buf, mimetype: 'video/mp4', caption: `${source === 'audio+thumb' ? '🎵' : '🎬'} *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}${source === 'audio+thumb' ? '\n_Official Audio (real video unavailable on this server)_' : `\n_via ${source}_`}` },
         { quoted: m }
       );
     },
