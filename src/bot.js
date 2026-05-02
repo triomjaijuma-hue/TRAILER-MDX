@@ -222,8 +222,19 @@ async function start() {
       lastPairCode = null;
       logger.info(`Connected as ${sock.user?.id}`);
       try {
+        const _klaTime = new Date().toLocaleTimeString('en-GB', {
+          timeZone: 'Africa/Kampala', hour: '2-digit', minute: '2-digit', hour12: false,
+        });
         await sock.sendMessage(sock.user.id, {
-          text: `*${config.botName} v${config.version}* is online.\nPrefixes: ${config.prefixes.join(' ')}\nType *.menu* to begin.`,
+          text: [
+            '🤖 *Bot Connected Successfully!*',
+            '',
+            '⏰ Time: *' + _klaTime + '* (Kampala)',
+            '✅ Status: *Online and Ready!*',
+            '',
+            '▸ Prefixes: *' + config.prefixes.join('  ') + '*',
+            '▸ Type *.menu* to see all commands',
+          ].join('\n'),
         });
       } catch (_) {}
       applyAvatar();
