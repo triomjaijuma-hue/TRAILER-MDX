@@ -369,13 +369,15 @@ async function downloadWithSoundCloud(query) {
 // ---------------------------------------------------------------------------
 // Strategy 3: Invidious  — video-id-based audio proxy
 // ---------------------------------------------------------------------------
+// Confirmed live instances (tested 2026-05-02 — return 200 for /latest_version?itag=18&local=true)
 const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://inv.thepixora.com',
-  'https://invidious.privacyredirect.com',
-  'https://yewtu.be',
   'https://iv.ggtyler.dev',
-  'https://invidious.fdn.fr',
+  'https://invidious.nerdvpn.de',
+  'https://invidious.projectsegfau.lt',
+  // Extras — may or may not work depending on day
+  'https://inv.nadeko.net',
+  'https://invidious.tiekoetter.com',
+  'https://invidious.perennialte.ch',
 ];
 
 async function downloadWithInvidious(videoUrl) {
@@ -607,20 +609,23 @@ async function downloadVideoWithPiped(videoUrl) {
   throw new Error('piped: ' + errs.join(' | '));
 }
 
-// Invidious video — itag 18 = 360p MP4, itag 22 = 720p MP4 (may exceed size limit)
+// Invidious video proxy — local=true makes Invidious server fetch+stream (Railway IP never hits YouTube CDN)
+// itag 18 = 360p MP4 combined | 22 = 720p MP4 combined | 36 = 240p 3GP | 17 = 144p 3GP
 async function downloadVideoWithInvidious(videoUrl) {
   const vid = videoUrl.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1];
   if (!vid) throw new Error('cannot extract video ID');
   const errs = [];
   for (const base of INVIDIOUS_INSTANCES) {
-    for (const itag of ['18', '22']) {
+    // Try combined formats in order: 360p → 480p (22 is 720p but often only available) → 240p → 144p
+    for (const itag of ['18', '22', '36', '17']) {
       try {
-        const r = await httpGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`);
+        const r = await httpGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`, 5);
         const ct = (r.headers['content-type'] || '').toLowerCase();
         if (ct.includes('html') || ct.includes('json') || ct.includes('text')) continue;
-        if (!isVideoBuffer(r.body)) continue;
-        if (r.body.length > MAX_VIDEO_BYTES) continue;
-        return { buf: r.body, source: `invidious(${base.split('/')[2]})`, mime: 'video/mp4' };
+        if (r.status === 404 || r.status === 403) continue; // itag not available for this video
+        if (!isVideoBuffer(r.body)) { errs.push(`${base.split('/')[2]}[${itag}]: not video (${r.body.length}b)`); continue; }
+        if (r.body.length > MAX_VIDEO_BYTES) { errs.push(`${base.split('/')[2]}[${itag}]: too large`); continue; }
+        return { buf: r.body, source: `invidious(${base.split('/')[2]})[${itag}]`, mime: 'video/mp4' };
       } catch (e) { errs.push(`${base.split('/')[2]}[${itag}]: ${(e.message || '').slice(0, 50)}`); }
     }
   }
@@ -722,25 +727,26 @@ async function downloadVideoAsAudioThumb(query, videoId) {
 async function downloadVideo(query, videoUrl, videoId) {
   const errs = [];
 
-  // 1. yt-dlp real video (works when installed)
+  // 1. Invidious proxy — proven to work on Railway (server fetches from YT, we fetch from server)
+  //    Tries itags 18/22/36/17 across 6 instances → highest coverage for all video types
+  try { return await downloadVideoWithInvidious(videoUrl); }
+  catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 150)}`); }
+
+  // 2. yt-dlp real video (works when installed on Railway)
   try { return await downloadVideoWithYtdlp(videoUrl); }
   catch (e) { errs.push(`yt-dlp: ${(e.message || '').slice(0, 100)}`); }
 
-  // 2. ytdl-core pure JS — combined MP4 (video+audio), no ffmpeg needed
+  // 3. ytdl-core pure JS — combined MP4 (video+audio), may get 429 from Railway
   try { return await downloadVideoWithYtdlCore(videoUrl); }
   catch (e) { errs.push(`ytdl-core: ${(e.message || '').slice(0, 100)}`); }
 
-  // 3. Piped — requests go to Piped's own proxy servers, not YouTube CDN → no Railway IP ban
+  // 4. Piped — requests go to Piped proxy servers (when instances are up)
   try { return await downloadVideoWithPiped(videoUrl); }
   catch (e) { errs.push(`piped: ${(e.message || '').slice(0, 100)}`); }
 
-  // 4. Cobalt — 'tunnel' responses go through Cobalt servers, not YouTube CDN
+  // 5. Cobalt — tunnel responses bypass YouTube CDN
   try { return await downloadVideoWithCobalt(videoUrl); }
   catch (e) { errs.push(`cobalt: ${(e.message || '').slice(0, 100)}`); }
-
-  // 5. Invidious proxy
-  try { return await downloadVideoWithInvidious(videoUrl); }
-  catch (e) { errs.push(`invidious: ${(e.message || '').slice(0, 100)}`); }
 
   // 6. Last resort: audio + static thumbnail (honest fallback)
   try { return await downloadVideoAsAudioThumb(query, videoId); }
