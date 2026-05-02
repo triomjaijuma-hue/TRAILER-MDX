@@ -57,4 +57,68 @@ module.exports = [
     if (parts.length < 3) return reply('Usage: .poll Question | A | B | C');
     await sock.sendMessage(jid, { poll: { name: parts[0], values: parts.slice(1), selectableCount: 1 } }, { quoted: m });
   } },
+
+  // .groups — list every group the bot is currently in, numbered and sorted.
+  // Use the numbers with .rejoin to get added back to a group you left.
+  { name: 'groups', aliases: ['grouplist'], owner: true,
+    description: 'List all groups the bot is in (use numbers with .rejoin)',
+    handler: async ({ sock, reply }) => {
+      let all;
+      try { all = await sock.groupFetchAllParticipating(); }
+      catch (e) { return reply(`❌ Could not fetch groups: ${e.message}`); }
+
+      const list = Object.values(all)
+        .map(g => ({ jid: g.id, name: g.subject || g.id }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      if (!list.length) return reply('Bot is not in any groups.');
+
+      const lines = list.map((g, i) =>
+        `${String(i + 1).padStart(2, ' ')}. ${g.name}\n    ${g.jid}`
+      );
+      reply(
+        `*📋 Groups bot is in (${list.length})*\n` +
+        `_Use \`.rejoin <number>\` to get added back_\n\n` +
+        lines.join('\n\n')
+      );
+    },
+  },
+
+  // .rejoin <number> — adds the sender (owner) back to a group they left.
+  // Requires the bot to still be a member and ideally an admin in that group.
+  // The group number comes from .groups above (sorted alphabetically, stable order).
+  { name: 'rejoin', aliases: ['groupjoin'], owner: true,
+    description: 'Rejoin a group you left: .rejoin <number from .groups>',
+    handler: async ({ sock, sender, argText, reply }) => {
+      const num = parseInt((argText || '').trim(), 10);
+      if (!num || num < 1) return reply('Usage: .rejoin <number>\nGet the number from .groups');
+
+      let all;
+      try { all = await sock.groupFetchAllParticipating(); }
+      catch (e) { return reply(`❌ Could not fetch groups: ${e.message}`); }
+
+      const list = Object.values(all)
+        .map(g => ({ jid: g.id, name: g.subject || g.id }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      const target = list[num - 1];
+      if (!target) return reply(`❌ No group #${num}. Run .groups to see the list (currently ${list.length} groups).`);
+
+      try {
+        const result = await sock.groupParticipantsUpdate(target.jid, [sender], 'add');
+        const status = result?.[0]?.status;
+        if (status === '200' || status === 200) {
+          reply(`✅ Added you back to *${target.name}*`);
+        } else if (status === '403') {
+          reply(`❌ Bot is not an admin in *${target.name}* — ask a group admin to make the bot admin first, then try again.`);
+        } else if (status === '408') {
+          reply(`❌ You were already removed by an admin — they need to add you back manually in *${target.name}*.`);
+        } else {
+          reply(`⚠️ Got status ${status} for *${target.name}* — you may already be in the group, or the bot lacks permission.`);
+        }
+      } catch (e) {
+        reply(`❌ Failed to add you to *${target.name}*: ${e.message}`);
+      }
+    },
+  },
 ];
