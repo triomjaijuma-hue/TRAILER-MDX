@@ -166,6 +166,30 @@ module.exports = [
       });
     }
 
+    // Provider 0: StreamElements TTS — free, no key, works from cloud/Railway IPs
+    function streamElementsTTS() {
+      return new Promise((resolve, reject) => {
+        const voice = 'Brian';
+        const url = `https://api.streamelements.com/kappa/v2/speech?voice=${voice}&text=${encodeURIComponent(text)}`;
+        const p = new URL(url);
+        https.get(
+          { hostname: p.hostname, path: p.pathname + p.search,
+            headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 },
+          res => {
+            if (res.statusCode !== 200)
+              return reject(new Error(`StreamElements TTS: HTTP ${res.statusCode}`));
+            const chunks = [];
+            res.on('data', d => chunks.push(d));
+            res.on('end', () => {
+              const buf = Buffer.concat(chunks);
+              if (buf.length < 512) return reject(new Error('StreamElements TTS: empty response'));
+              resolve(buf);
+            });
+          }
+        ).on('error', reject);
+      });
+    }
+
     // Provider 1: Google Translate TTS — unofficial but very reliable, no API key needed
     function googleTTS(lang) {
       lang = lang || 'en';
@@ -234,11 +258,15 @@ module.exports = [
     try {
       let audioBuf, ext;
 
-      // Try Google Translate TTS first — free, no key, high quality
-      try { audioBuf = await googleTTS('en'); ext = 'mp3'; }
+      // Try StreamElements first — cloud-IP friendly, no key, reliable
+      try { audioBuf = await streamElementsTTS(); ext = 'mp3'; }
       catch (_) {
-        // Fallback to local espeak binary
-        audioBuf = await espeakTTS(); ext = 'wav';
+        // Fallback: Google Translate TTS
+        try { audioBuf = await googleTTS('en'); ext = 'mp3'; }
+        catch (_2) {
+          // Final fallback: offline espeak binary (always available in Docker image)
+          audioBuf = await espeakTTS(); ext = 'wav';
+        }
       }
 
       const oggBuf = await toOgg(audioBuf, ext);

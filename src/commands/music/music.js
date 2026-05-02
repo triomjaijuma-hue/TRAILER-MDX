@@ -304,6 +304,9 @@ async function getSoundCloudClientId() {
     'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX',
     'a3e059563d7fd3372b49b37f00a00bcf',
     '2t9loNQH90kzJcsFCODdigxfp325aq4z',
+    'YkrMxDLHXYfnGGjDKEEWSmjBbmMVyCme',
+    'ZvzEiKBPMoRPlrMi5mMjTIDJjloMgMuZ',
+    'QiCa9cJoFGijVMG0JLkzqWUTIRBhPcoE',
   ];
   try {
     const home = await httpGet('https://soundcloud.com', 3);
@@ -765,21 +768,21 @@ async function downloadVideo(query, videoUrl, videoId) {
 async function downloadAudio(query, videoUrl) {
   const errs = [];
 
-  // 1. yt-dlp (python3 -m yt_dlp first, then binary)
-  try { return await downloadWithYtdlp(videoUrl); }
-  catch (e) { errs.push('yt-dlp: ' + (e.message || '').slice(0, 150)); }
-
-  // 2. SoundCloud — cloud-IP friendly, doesn't block Railway
+  // 1. SoundCloud — cloud-IP friendly, doesn't throttle like YouTube, works on Railway
   try { return await downloadWithSoundCloud(query); }
   catch (e) { errs.push('soundcloud: ' + (e.message || '').slice(0, 100)); }
 
-  // 3. Invidious proxy
+  // 2. Invidious proxy — video-ID based, bypasses YouTube CDN IP block
   try { return await downloadWithInvidious(videoUrl); }
   catch (e) { errs.push('invidious: ' + (e.message || '').slice(0, 100)); }
 
-  // 4. Cobalt
+  // 3. Cobalt
   try { return await downloadWithCobalt(videoUrl); }
   catch (e) { errs.push('cobalt: ' + (e.message || '').slice(0, 100)); }
+
+  // 4. yt-dlp — last resort (Railway IPs are often blocked by YouTube; may be slow)
+  try { return await downloadWithYtdlp(videoUrl); }
+  catch (e) { errs.push('yt-dlp: ' + (e.message || '').slice(0, 150)); }
 
   throw new Error(errs.join('\n'));
 }
