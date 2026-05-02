@@ -1,41 +1,34 @@
 'use strict';
-const yts       = require('yt-search');
-const https     = require('https');
-const http      = require('http');
+const yts     = require('yt-search');
+const https   = require('https');
+const http    = require('http');
 const { execFile, exec } = require('child_process');
-const fs        = require('fs');
-const path      = require('path');
-const helpers   = require('../../lib/helpers');
-const config    = require('../../lib/config');
+const fs      = require('fs');
+const path    = require('path');
+const helpers = require('../../lib/helpers');
+const config  = require('../../lib/config');
 
-const MIN_AUDIO_BYTES = 50 * 1024; // 50 KB — anything smaller is an error page or stub
+const MIN_AUDIO_BYTES = 64 * 1024; // 64 KB minimum — real songs are always larger
 
 // ---------------------------------------------------------------------------
 // Magic-byte audio validation — rejects HTML pages, JSON errors, stubs
 // ---------------------------------------------------------------------------
 function isAudioBuffer(buf) {
   if (!buf || buf.length < MIN_AUDIO_BYTES) return false;
-  // ID3-tagged MP3
-  if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return true;
-  // MPEG sync (MP3 without ID3)
-  if (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0) return true;
-  // M4A / MP4 — 'ftyp' at offset 4
-  if (buf.length > 11 && buf.slice(4, 8).toString('ascii') === 'ftyp') return true;
-  // WebM / Matroska (EBML header)
-  if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return true;
-  // OGG
-  if (buf.slice(0, 4).toString('ascii') === 'OggS') return true;
-  // WAV
-  if (buf.slice(0, 4).toString('ascii') === 'RIFF') return true;
-  // FLAC
-  if (buf.slice(0, 4).toString('ascii') === 'fLaC') return true;
+  if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return true; // ID3 MP3
+  if (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0) return true;           // MPEG sync
+  if (buf.length > 11 && buf.slice(4, 8).toString('ascii') === 'ftyp') return true; // M4A/MP4
+  if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return true; // WebM
+  if (buf.slice(0, 4).toString('ascii') === 'OggS') return true;           // OGG
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF') return true;           // WAV
+  if (buf.slice(0, 4).toString('ascii') === 'fLaC') return true;           // FLAC
   return false;
 }
 
 // ---------------------------------------------------------------------------
-// Shared HTTP helper — returns status, headers, and body
+// Shared HTTP helper (follows redirects, returns status + headers + body)
 // ---------------------------------------------------------------------------
-function httpGet(url, maxRedir) {
+function httpGet(url, maxRedir, extraHeaders) {
   maxRedir = maxRedir == null ? 8 : maxRedir;
   return new Promise((resolve, reject) => {
     let p;
@@ -46,32 +39,31 @@ function httpGet(url, maxRedir) {
         hostname: p.hostname,
         port: p.port || undefined,
         path: p.pathname + p.search,
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          ...extraHeaders,
+        },
         timeout: 30000,
       },
       res => {
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
           return maxRedir > 0
-            ? resolve(httpGet(res.headers.location, maxRedir - 1))
+            ? resolve(httpGet(res.headers.location, maxRedir - 1, extraHeaders))
             : reject(new Error('too many redirects'));
         }
         const chunks = [];
         res.on('data', d => chunks.push(d));
-        res.on('end', () => resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          body: Buffer.concat(chunks),
-        }));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
         res.on('error', reject);
       }
     );
     req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('timeout', () => req.destroy(new Error('timeout')));
   });
 }
 
 // ---------------------------------------------------------------------------
-// YouTube search
+// YouTube search + result picker
 // ---------------------------------------------------------------------------
 async function ytSearch(q) {
   try { const r = await yts(q); if (r?.videos?.length) return r; } catch (_) {}
@@ -127,36 +119,86 @@ function pickBest(vids, q) {
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 1: yt-dlp  — installed via nixpacks / pip / postinstall.js
-// Downloads directly as MP3 to skip ffmpeg re-encode step entirely.
+// Strategy 1: yt-dlp
+//
+// The binary at /usr/local/bin/yt-dlp may be a Python zipapp with a bytecode
+// mismatch that crashes on import. We test several invocation styles and pick
+// whichever actually responds to --version.
+//
+// Priority: python3 -m yt_dlp  >  nix/postinstall binary  >  pip binary
+// The python3 -m approach bypasses the broken zipapp entirely.
 // ---------------------------------------------------------------------------
-let _ytdlpBin = null;
+let _ytdlp = null; // { bin, prefix } — cached after first successful probe
+
+function testCmd(bin, args) {
+  return new Promise(r => {
+    execFile(bin, args, { timeout: 10000 }, e => r(!e));
+  });
+}
+
 async function getYtdlp() {
-  if (_ytdlpBin) return _ytdlpBin;
+  if (_ytdlp) return _ytdlp;
+
+  // 1. python3 -m yt_dlp  — works even when the standalone binary is broken
+  if (await testCmd('python3', ['-m', 'yt_dlp', '--version'])) {
+    _ytdlp = { bin: 'python3', prefix: ['-m', 'yt_dlp'] };
+    return _ytdlp;
+  }
+  if (await testCmd('python', ['-m', 'yt_dlp', '--version'])) {
+    _ytdlp = { bin: 'python', prefix: ['-m', 'yt_dlp'] };
+    return _ytdlp;
+  }
+
+  // 2. Known binary paths — must be a regular FILE (not a directory)
   const candidates = [
     process.env.YTDLP_BIN,
-    '/usr/local/bin/yt-dlp',                         // Docker pip install
-    path.join(__dirname, '../../../bin/yt-dlp'),      // postinstall.js download
-    '/root/.nix-profile/bin/yt-dlp',                 // nixpacks profile
+    '/root/.nix-profile/bin/yt-dlp',               // nixpacks (highest priority)
     '/nix/var/nix/profiles/default/bin/yt-dlp',
     '/home/user/.nix-profile/bin/yt-dlp',
+    path.join(__dirname, '../../../bin/yt-dlp'),    // postinstall.js download
+    '/usr/local/bin/yt-dlp',                        // pip (broken zipapp — try last)
     '/usr/bin/yt-dlp',
     '/bin/yt-dlp',
     '/tmp/yt-dlp',
   ].filter(Boolean);
+
   for (const p of candidates) {
-    try { fs.accessSync(p, fs.constants.X_OK); _ytdlpBin = p; return p; } catch (_) {}
+    try {
+      const stat = fs.statSync(p);
+      if (!stat.isFile()) continue;               // skip directories
+      fs.accessSync(p, fs.constants.X_OK);
+      if (await testCmd(p, ['--version'])) {
+        _ytdlp = { bin: p, prefix: [] };
+        return _ytdlp;
+      }
+    } catch (_) {}
   }
+
+  // 3. PATH search
   const fromPath = await new Promise(r =>
     exec('which yt-dlp 2>/dev/null || command -v yt-dlp 2>/dev/null', { timeout: 8000 },
       (e, o) => r((o || '').trim() || null))
   );
-  if (fromPath) { _ytdlpBin = fromPath; return fromPath; }
+  if (fromPath) {
+    try {
+      const stat = fs.statSync(fromPath);
+      if (stat.isFile() && await testCmd(fromPath, ['--version'])) {
+        _ytdlp = { bin: fromPath, prefix: [] };
+        return _ytdlp;
+      }
+    } catch (_) {}
+  }
+
+  // 4. Nix store search
   const fromNix = await new Promise(r =>
     exec('find /nix /run -name yt-dlp -type f 2>/dev/null | head -1', { timeout: 30000 },
       (e, o) => r((o || '').trim() || null))
   );
-  if (fromNix) { _ytdlpBin = fromNix; return fromNix; }
+  if (fromNix && await testCmd(fromNix, ['--version'])) {
+    _ytdlp = { bin: fromNix, prefix: [] };
+    return _ytdlp;
+  }
+
   return null;
 }
 getYtdlp().catch(() => {}); // warm up on startup
@@ -186,8 +228,8 @@ const YT_CLIENTS = [
 ];
 
 async function downloadWithYtdlp(videoUrl) {
-  const bin = await getYtdlp();
-  if (!bin) throw new Error('yt-dlp: binary not found');
+  const ytdlp = await getYtdlp();
+  if (!ytdlp) throw new Error('yt-dlp: not available (binary not found and python3 -m yt_dlp failed)');
   const cookiesFile = loadCookies();
   const errs = [];
   for (const { client, ua } of YT_CLIENTS) {
@@ -195,53 +237,125 @@ async function downloadWithYtdlp(videoUrl) {
       const buf = await new Promise((resolve, reject) => {
         const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
         const out = `/tmp/yt_${id}.mp3`;
-        // -x --audio-format mp3: extract audio and encode as MP3 inside yt-dlp itself
         const args = [
+          ...ytdlp.prefix,
           '-x', '--audio-format', 'mp3', '--audio-quality', '128K',
           '--no-playlist', '--no-warnings', '--no-check-certificate',
           '--extractor-args', `youtube:player_client=${client}`,
           '--user-agent', ua,
           '--max-filesize', '75m',
-          '--socket-timeout', '45',
+          '--socket-timeout', '30',
           '--retries', '2',
           ...(cookiesFile ? ['--cookies', cookiesFile] : []),
           '-o', out,
           videoUrl,
         ];
-        execFile(bin, args, { timeout: 240000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
+        execFile(ytdlp.bin, args, { timeout: 240000, maxBuffer: 80 * 1024 * 1024 }, (err, _so, se) => {
           if (err) {
             try { fs.unlinkSync(out); } catch (_) {}
-            const msg = (se || err.message || '').split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 250);
-            return reject(new Error(msg || err.message));
+            const msg = (se || err.message || '').split('\n').filter(Boolean).slice(-3).join(' ').slice(0, 200);
+            return reject(new Error(`[${client}] ${msg}`));
           }
           try {
-            // yt-dlp may rename .mp3 from .m4a — look for any mp3 with matching id
-            let finalPath = out;
-            if (!fs.existsSync(out)) {
-              const tmp = `/tmp`;
-              const match = fs.readdirSync(tmp).find(f => f.startsWith(`yt_${id}`) && f.endsWith('.mp3'));
-              if (match) finalPath = path.join(tmp, match);
-            }
-            const buf = fs.readFileSync(finalPath);
-            fs.unlinkSync(finalPath);
+            const buf = fs.readFileSync(out);
+            try { fs.unlinkSync(out); } catch (_) {}
             resolve(buf);
           } catch (e) { reject(e); }
         });
       });
-      if (!isAudioBuffer(buf)) throw new Error(`yt-dlp[${client}]: output is not valid audio (${buf.length} bytes)`);
+      if (!isAudioBuffer(buf)) throw new Error(`[${client}] output not valid audio (${buf.length} bytes)`);
       return { buf, source: `yt-dlp[${client}]`, mime: 'audio/mpeg' };
-    } catch (e) { errs.push(`[${client}]: ${(e.message || '').slice(0, 120)}`); }
+    } catch (e) { errs.push((e.message || '').slice(0, 150)); }
   }
-  throw new Error('yt-dlp ' + errs.join(' | '));
+  throw new Error('yt-dlp: ' + errs.join(' | '));
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 2: Invidious  — proxies audio through Invidious servers.
-// The 'local=true' flag makes Invidious stream the bytes to us, so
-// Railway's cloud IP never touches YouTube CDN directly.
+// Strategy 2: SoundCloud
+//
+// SoundCloud does NOT block cloud IPs like YouTube does.
+// We search SoundCloud for the same query and download from there.
+// Client IDs are extracted from SoundCloud's own JS bundles.
+// ---------------------------------------------------------------------------
+let _scClientId = null;
+let _scClientIdFetched = 0;
+
+async function getSoundCloudClientId() {
+  // Cache for 6 hours
+  if (_scClientId && Date.now() - _scClientIdFetched < 6 * 3600 * 1000) return _scClientId;
+  // Known working client IDs (rotated periodically by SoundCloud)
+  const fallbackIds = [
+    'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX',
+    'a3e059563d7fd3372b49b37f00a00bcf',
+    '2t9loNQH90kzJcsFCODdigxfp325aq4z',
+  ];
+  try {
+    const home = await httpGet('https://soundcloud.com', 3);
+    const html = home.body.toString();
+    const scripts = [...html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"' ]+\.js/g)].map(m => m[0]);
+    for (const url of scripts.slice(-5)) {
+      try {
+        const s = await httpGet(url, 3);
+        const m = s.body.toString().match(/client_id\s*:\s*"([a-zA-Z0-9]{30,40})"/);
+        if (m) {
+          _scClientId = m[1];
+          _scClientIdFetched = Date.now();
+          return _scClientId;
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+  _scClientId = fallbackIds[0];
+  _scClientIdFetched = Date.now();
+  return _scClientId;
+}
+
+async function soundCloudSearch(q) {
+  const clientId = await getSoundCloudClientId();
+  const r = await httpGet(
+    `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${clientId}&limit=5&offset=0`,
+    5,
+    { Accept: 'application/json' }
+  );
+  if (r.status !== 200) throw new Error(`SoundCloud search HTTP ${r.status}`);
+  const data = JSON.parse(r.body.toString());
+  return (data.collection || []).filter(t => t.streamable && t.duration < 720000);
+}
+
+async function downloadWithSoundCloud(query) {
+  const clientId = await getSoundCloudClientId();
+  const tracks = await soundCloudSearch(query);
+  if (!tracks.length) throw new Error('SoundCloud: no results');
+  const errs = [];
+  for (const track of tracks.slice(0, 3)) {
+    try {
+      // Get the stream URL
+      const streamUrl = track.stream_url
+        || track.media?.transcodings?.find(t => t.format?.protocol === 'progressive')?.url;
+      if (!streamUrl) continue;
+      const resolved = await httpGet(`${streamUrl}?client_id=${clientId}`, 5, { Accept: 'application/json' });
+      if (resolved.status !== 200) continue;
+      const { url } = JSON.parse(resolved.body.toString());
+      if (!url) continue;
+      const dl = await httpGet(url, 5);
+      if (!isAudioBuffer(dl.body)) continue;
+      return {
+        buf: dl.body,
+        source: `soundcloud(${track.user?.username || 'unknown'})`,
+        mime: 'audio/mpeg',
+        title: `${track.user?.username || ''} — ${track.title}`,
+      };
+    } catch (e) { errs.push((e.message || '').slice(0, 80)); }
+  }
+  throw new Error('SoundCloud: ' + (errs.join(' | ') || 'no playable stream found'));
+}
+
+// ---------------------------------------------------------------------------
+// Strategy 3: Invidious  — video-id-based audio proxy
 // ---------------------------------------------------------------------------
 const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
+  'https://inv.thepixora.com',
   'https://invidious.privacyredirect.com',
   'https://yewtu.be',
   'https://iv.ggtyler.dev',
@@ -257,62 +371,25 @@ async function downloadWithInvidious(videoUrl) {
       try {
         const r = await httpGet(`${base}/latest_version?id=${vid}&itag=${itag}&local=true`);
         const ct = (r.headers['content-type'] || '').toLowerCase();
-        // Reject HTML pages (Cloudflare challenges, error pages, etc.)
-        if (ct.includes('html') || ct.includes('json')) {
-          errs.push(`invidious[${itag}@${base.split('/')[2]}]: got ${ct}`);
+        if (ct.includes('html') || ct.includes('json') || ct.includes('text')) {
+          errs.push(`${base.split('/')[2]}[${itag}]: got ${ct.split(';')[0]}`);
           continue;
         }
         if (!isAudioBuffer(r.body)) {
-          errs.push(`invidious[${itag}@${base.split('/')[2]}]: invalid audio (${r.body.length} bytes)`);
+          errs.push(`${base.split('/')[2]}[${itag}]: invalid audio (${r.body.length}b)`);
           continue;
         }
         return { buf: r.body, source: `invidious(${base.split('/')[2]})`, mime: itag === '140' ? 'audio/mp4' : 'audio/webm' };
-      } catch (e) { errs.push(`invidious[${itag}@${base.split('/')[2]}]: ${(e.message || '').slice(0, 60)}`); }
+      } catch (e) { errs.push(`${base.split('/')[2]}: ${(e.message || '').slice(0, 50)}`); }
     }
   }
-  throw new Error(errs.join(' | ') || 'invidious: all instances failed');
+  throw new Error('invidious: ' + errs.join(' | '));
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 3: Piped API  — open-source YouTube frontend with audio proxying
+// Strategy 4: Cobalt
 // ---------------------------------------------------------------------------
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.projectsegfau.lt',
-];
-
-async function downloadWithPiped(videoUrl) {
-  const vid = videoUrl.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)?.[1];
-  if (!vid) throw new Error('piped: cannot extract video ID');
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const r = await httpGet(`${base}/streams/${vid}`);
-      if (r.status !== 200) continue;
-      const data = JSON.parse(r.body.toString());
-      const streams = (data.audioStreams || []).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      for (const s of streams) {
-        if (!s.url) continue;
-        try {
-          const dl = await httpGet(s.url);
-          const ct = (dl.headers['content-type'] || '').toLowerCase();
-          if (ct.includes('html')) continue;
-          if (!isAudioBuffer(dl.body)) continue;
-          return { buf: dl.body, source: `piped(${base.split('/')[2]})`, mime: s.mimeType || 'audio/mp4' };
-        } catch (_) {}
-      }
-    } catch (_) {}
-  }
-  throw new Error('piped: all instances failed');
-}
-
-// ---------------------------------------------------------------------------
-// Strategy 4: Cobalt  — handles YouTube bot-check via external service
-// ---------------------------------------------------------------------------
-const COBALT_INSTANCES = [
-  'https://api.cobalt.tools',
-  'https://cobalt.catvibers.me',
-];
+const COBALT_INSTANCES = ['https://api.cobalt.tools', 'https://cobalt.catvibers.me'];
 
 async function downloadWithCobalt(videoUrl) {
   for (const base of COBALT_INSTANCES) {
@@ -321,27 +398,13 @@ async function downloadWithCobalt(videoUrl) {
       const p = new URL(base);
       const res = await new Promise((resolve, reject) => {
         const req = https.request(
-          {
-            hostname: p.hostname,
-            path: p.pathname || '/',
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Accept: 'application/json',
-              'User-Agent': 'Mozilla/5.0',
-              'Content-Length': Buffer.byteLength(body),
-            },
-          },
-          resp => {
-            const chunks = [];
-            resp.on('data', c => chunks.push(c));
-            resp.on('end', () => resolve({ status: resp.statusCode, body: Buffer.concat(chunks).toString() }));
-          }
+          { hostname: p.hostname, path: p.pathname || '/', method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', 'Content-Length': Buffer.byteLength(body) } },
+          resp => { const c = []; resp.on('data', d => c.push(d)); resp.on('end', () => resolve({ status: resp.statusCode, body: Buffer.concat(c).toString() })); }
         );
         req.on('error', reject);
-        req.setTimeout(20000, () => req.destroy(new Error('cobalt timeout')));
-        req.write(body);
-        req.end();
+        req.setTimeout(20000, () => req.destroy(new Error('timeout')));
+        req.write(body); req.end();
       });
       if (res.status !== 200) continue;
       const data = JSON.parse(res.body);
@@ -357,46 +420,51 @@ async function downloadWithCobalt(videoUrl) {
 // ---------------------------------------------------------------------------
 // Main download orchestrator
 // ---------------------------------------------------------------------------
-async function downloadAudio(url) {
+async function downloadAudio(query, videoUrl) {
   const errs = [];
-  for (const [label, fn] of [
-    ['yt-dlp',    () => downloadWithYtdlp(url)],
-    ['invidious', () => downloadWithInvidious(url)],
-    ['piped',     () => downloadWithPiped(url)],
-    ['cobalt',    () => downloadWithCobalt(url)],
-  ]) {
-    try { return await fn(); }
-    catch (e) { errs.push(`${label}: ${(e.message || '').slice(0, 150)}`); }
-  }
+
+  // 1. yt-dlp (python3 -m yt_dlp first, then binary)
+  try { return await downloadWithYtdlp(videoUrl); }
+  catch (e) { errs.push('yt-dlp: ' + (e.message || '').slice(0, 150)); }
+
+  // 2. SoundCloud — cloud-IP friendly, doesn't block Railway
+  try { return await downloadWithSoundCloud(query); }
+  catch (e) { errs.push('soundcloud: ' + (e.message || '').slice(0, 100)); }
+
+  // 3. Invidious proxy
+  try { return await downloadWithInvidious(videoUrl); }
+  catch (e) { errs.push('invidious: ' + (e.message || '').slice(0, 100)); }
+
+  // 4. Cobalt
+  try { return await downloadWithCobalt(videoUrl); }
+  catch (e) { errs.push('cobalt: ' + (e.message || '').slice(0, 100)); }
+
   throw new Error(errs.join('\n'));
 }
 
 // ---------------------------------------------------------------------------
-// ffmpeg: convert any audio buffer → MP3 (only called for non-MP3 sources)
+// ffmpeg: convert non-MP3 audio → MP3
 // ---------------------------------------------------------------------------
 function toMp3(buf, mime) {
-  // Already MP3 — skip conversion
-  if ((mime || '').includes('mpeg') || (mime || '').includes('mp3')) return Promise.resolve(buf);
+  if (!mime || mime.includes('mpeg') || mime.includes('mp3')) return Promise.resolve(buf);
   return new Promise((resolve, reject) => {
     const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
-    const ext = (mime || '').includes('webm') ? 'webm' : 'm4a';
+    const ext = mime.includes('webm') ? 'webm' : 'm4a';
     const inp = `/tmp/play_${id}.${ext}`;
     const out = `/tmp/play_${id}.mp3`;
     fs.writeFileSync(inp, buf);
-    execFile(
-      'ffmpeg',
-      ['-y', '-i', inp, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', out],
+    execFile('ffmpeg', ['-y', '-i', inp, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', out],
       { timeout: 120000, maxBuffer: 80 * 1024 * 1024 },
       err => {
         try { fs.unlinkSync(inp); } catch (_) {}
         if (err) {
           try { fs.unlinkSync(out); } catch (_) {}
-          return reject(new Error('ffmpeg conversion failed: ' + (err.message || '').slice(0, 200)));
+          return reject(new Error('ffmpeg: ' + (err.message || '').slice(0, 150)));
         }
         try {
           const mp3 = fs.readFileSync(out);
-          fs.unlinkSync(out);
-          if (!isAudioBuffer(mp3)) return reject(new Error('ffmpeg: output is not valid audio'));
+          try { fs.unlinkSync(out); } catch (_) {}
+          if (!isAudioBuffer(mp3)) return reject(new Error('ffmpeg: output not valid audio'));
           resolve(mp3);
         } catch (e) { reject(e); }
       }
@@ -411,11 +479,11 @@ async function fetchLyrics(q) {
   const parts  = q.split(/\s*-\s*/);
   const artist = parts.length > 1 ? parts[0].trim() : '';
   const song   = (parts.length > 1 ? parts.slice(1).join(' - ') : q).trim();
-  const tryUrl = async url => {
+  const tryJson = async url => {
     try { const r = await httpGet(url); return r.status === 200 ? JSON.parse(r.body.toString()) : null; }
     catch (_) { return null; }
   };
-  const d1 = await tryUrl(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`);
+  const d1 = await tryJson(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`);
   if (Array.isArray(d1)) {
     const h = d1.find(x => x.plainLyrics || x.syncedLyrics);
     if (h) {
@@ -424,10 +492,10 @@ async function fetchLyrics(q) {
     }
   }
   if (artist && song) {
-    const d2 = await tryUrl(`https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(song)}`);
+    const d2 = await tryJson(`https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(song)}`);
     if (d2?.plainLyrics) return { text: d2.plainLyrics, title: `${d2.artistName} — ${d2.trackName}` };
   }
-  const d3 = await tryUrl(`https://some-random-api.com/lyrics?title=${encodeURIComponent(q)}`);
+  const d3 = await tryJson(`https://some-random-api.com/lyrics?title=${encodeURIComponent(q)}`);
   if (d3?.lyrics) return { text: d3.lyrics, title: d3.title ? `${d3.author || ''} — ${d3.title}` : null };
   return null;
 }
@@ -451,43 +519,52 @@ module.exports = [
 
       await reply(`🎵 Found: *${v.title}*\nDownloading audio…`);
 
-      let buf, source, mime;
+      let result;
       try {
-        ({ buf, source, mime } = await downloadAudio(v.url));
+        result = await downloadAudio(argText, v.url);
       } catch (e) {
         return reply(`❌ Download failed:\n_${e.message?.slice(0, 500)}_`);
       }
 
-      // Convert to MP3 only if the source isn't already MP3
-      let finalBuf;
+      let { buf, source, mime } = result;
+
       try {
-        finalBuf = await toMp3(buf, mime);
+        buf = await toMp3(buf, mime);
       } catch (e) {
-        return reply(`❌ Audio conversion failed:\n_${e.message?.slice(0, 300)}_`);
+        return reply(`❌ Conversion failed:\n_${e.message?.slice(0, 200)}_`);
       }
 
-      await sock.sendMessage(jid, { audio: finalBuf, mimetype: 'audio/mpeg', ptt: false }, { quoted: m });
-      await reply(`🎵 *${v.title}*\n${v.author?.name || ''} · ${v.timestamp || ''}\n_via ${source}_`);
+      const displayTitle = result.title || `${v.title}\n${v.author?.name || ''} · ${v.timestamp || ''}`;
+      await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mpeg', ptt: false }, { quoted: m });
+      await reply(`🎵 *${displayTitle}*\n_via ${source}_`);
     },
   },
 
   {
     name: 'ytdlpcheck',
     aliases: ['musiccheck'],
-    description: 'Diagnose yt-dlp availability and audio validation',
+    description: 'Diagnose yt-dlp and SoundCloud availability',
     handler: async ({ reply }) => {
-      const bin = await getYtdlp();
-      if (!bin) return reply('❌ yt-dlp *not found*.\n\nCheck Railway build logs — nixpacks or postinstall may have failed.');
-      const ver = await new Promise(r =>
-        execFile(bin, ['--version'], { timeout: 8000 }, (e, o) => r(e ? 'error: ' + e.message : o.trim()))
-      );
+      const ytdlp = await getYtdlp();
+      let ytdlpStatus = '❌ not found';
+      if (ytdlp) {
+        const ver = await new Promise(r =>
+          execFile(ytdlp.bin, [...ytdlp.prefix, '--version'], { timeout: 8000 }, (e, o) => r(e ? 'error' : o.trim()))
+        );
+        const mode = ytdlp.prefix.length ? `python3 -m yt_dlp` : ytdlp.bin;
+        ytdlpStatus = `✅ ${mode} (${ver})`;
+      }
+      let scStatus = '❌ failed';
+      try {
+        const id = await getSoundCloudClientId();
+        scStatus = `✅ client_id: ${id.slice(0, 8)}…`;
+      } catch (_) {}
       const cookies = loadCookies();
       reply(
         `*Music Diagnostics*\n\n` +
-        `yt-dlp: ✅ \`${bin}\`\n` +
-        `Version: ${ver}\n` +
-        `Cookies: ${cookies ? `✅ \`${cookies}\`` : '❌ not set (set YOUTUBE_COOKIES env var if blocked)'}\n` +
-        `Min audio size: ${MIN_AUDIO_BYTES / 1024} KB`
+        `yt-dlp: ${ytdlpStatus}\n` +
+        `SoundCloud: ${scStatus}\n` +
+        `Cookies: ${cookies ? `✅ \`${cookies}\`` : '❌ not set'}`
       );
     },
   },
