@@ -20,6 +20,9 @@ function start(bot) {
   const app = express();
   app.use(express.json());
 
+  // Health check must be before basicAuth so Railway can always reach it
+  app.get('/healthz', (_req, res) => res.send('ok'));
+
   app.use(basicAuth);
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
@@ -56,8 +59,6 @@ function start(bot) {
       res.status(500).json({ error: e?.message });
     }
   });
-
-  app.get('/healthz', (_req, res) => res.send('ok'));
 
   app.listen(config.port, '0.0.0.0', () => {
     logger.info(`Web pairing UI listening on :${config.port}`);

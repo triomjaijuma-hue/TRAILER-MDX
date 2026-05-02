@@ -22,11 +22,16 @@ process.on('SIGINT',  () => gracefulExit('SIGINT'));
 
 async function main() {
   logger.info(`Starting ${config.botName} v${config.version}`);
+
+  // Start the web server immediately so Railway's /healthz check passes
+  // right away — before the session restore (which involves a GitHub API call).
+  web.start(bot);
+
   // Pull last known session from the encrypted GitHub backup BEFORE Baileys
   // looks for creds. No-op if a local session is already on disk, or if
   // SESSION_BACKUP_TOKEN / SESSION_SECRET aren't configured.
   await sessionBackup.restore();
-  web.start(bot);
+
   if (bot.hasSession()) {
     bot.start().catch((e) => logger.error({ err: e?.message }, 'bot.start failed'));
   } else {
