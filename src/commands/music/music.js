@@ -299,14 +299,14 @@ let _scClientIdFetched = 0;
 async function getSoundCloudClientId() {
   // Cache for 6 hours
   if (_scClientId && Date.now() - _scClientIdFetched < 6 * 3600 * 1000) return _scClientId;
-  // Known working client IDs (rotated periodically by SoundCloud)
+  // Known working client IDs — updated regularly, last verified 2026-05-02
   const fallbackIds = [
+    '1Gbi6DBGBMULQH8MuhNvI1HzL9AiX2Pa', // verified 2026-05-02
     'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX',
     'a3e059563d7fd3372b49b37f00a00bcf',
     '2t9loNQH90kzJcsFCODdigxfp325aq4z',
     'YkrMxDLHXYfnGGjDKEEWSmjBbmMVyCme',
     'ZvzEiKBPMoRPlrMi5mMjTIDJjloMgMuZ',
-    'QiCa9cJoFGijVMG0JLkzqWUTIRBhPcoE',
   ];
   try {
     const home = await httpGet('https://soundcloud.com', 3);
@@ -315,7 +315,12 @@ async function getSoundCloudClientId() {
     for (const url of scripts.slice(-5)) {
       try {
         const s = await httpGet(url, 3);
-        const m = s.body.toString().match(/client_id\s*:\s*"([a-zA-Z0-9]{30,40})"/);
+        const js = s.body.toString();
+        // Multiple patterns — SoundCloud minifies differently across bundles
+        const m = js.match(/,client_id:"([a-zA-Z0-9]{20,45})"/)
+                || js.match(/client_id:"([a-zA-Z0-9]{20,45})"/)
+                || js.match(/client_id\s*:\s*"([a-zA-Z0-9]{20,45})"/)
+                || js.match(/"client_id":"([a-zA-Z0-9]{20,45})"/);
         if (m) {
           _scClientId = m[1];
           _scClientIdFetched = Date.now();
@@ -324,6 +329,18 @@ async function getSoundCloudClientId() {
       } catch (_) {}
     }
   } catch (_) {}
+  // Try all fallback IDs to find one that actually works
+  for (const id of fallbackIds) {
+    try {
+      const t = await httpGet(
+        `https://api-v2.soundcloud.com/search/tracks?q=test&client_id=${id}&limit=1`, 3);
+      if (t.status === 200) {
+        _scClientId = id;
+        _scClientIdFetched = Date.now();
+        return _scClientId;
+      }
+    } catch (_) {}
+  }
   _scClientId = fallbackIds[0];
   _scClientIdFetched = Date.now();
   return _scClientId;
@@ -367,6 +384,60 @@ async function downloadWithSoundCloud(query) {
     } catch (e) { errs.push((e.message || '').slice(0, 80)); }
   }
   throw new Error('SoundCloud: ' + (errs.join(' | ') || 'no playable stream found'));
+}
+
+// ---------------------------------------------------------------------------
+// Strategy 2b: SoundCloud search → yt-dlp
+//
+// SoundCloud search API works fine from cloud/Railway IPs. We find the track
+// permalink, then hand it to yt-dlp which handles SoundCloud's HLS streams
+// internally. This is the most reliable audio path on Railway.
+// ---------------------------------------------------------------------------
+async function downloadWithSoundCloudYtdlp(query) {
+  const tracks = await soundCloudSearch(query);
+  if (!tracks.length) throw new Error('SoundCloud: no results');
+  const ytdlp = await getYtdlp();
+  if (!ytdlp) throw new Error('SoundCloud-ytdlp: yt-dlp not available');
+  const errs = [];
+  for (const track of tracks.slice(0, 3)) {
+    const trackUrl = track.permalink_url;
+    if (!trackUrl) continue;
+    try {
+      const buf = await new Promise((resolve, reject) => {
+        const id  = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+        const out = `/tmp/sc_${id}.mp3`;
+        const args = [
+          ...ytdlp.prefix,
+          '-x', '--audio-format', 'mp3', '--audio-quality', '128K',
+          '--no-playlist', '--no-warnings', '--no-check-certificate',
+          '--max-filesize', '50m', '--socket-timeout', '30', '--retries', '2',
+          '-o', out,
+          trackUrl,
+        ];
+        execFile(ytdlp.bin, args,
+          { timeout: 150000, maxBuffer: 60 * 1024 * 1024 },
+          (err, _so, se) => {
+            if (err) {
+              try { fs.unlinkSync(out); } catch (_) {}
+              return reject(new Error((se || err.message || '').slice(-200)));
+            }
+            try {
+              const mp3 = fs.readFileSync(out);
+              try { fs.unlinkSync(out); } catch (_) {}
+              resolve(mp3);
+            } catch (e) { reject(e); }
+          }
+        );
+      });
+      if (!isAudioBuffer(buf)) throw new Error('output not valid audio');
+      return {
+        buf,
+        source: `soundcloud-ytdlp(${track.user?.username || 'sc'})`,
+        mime: 'audio/mpeg',
+      };
+    } catch (e) { errs.push((e.message || '').slice(0, 120)); }
+  }
+  throw new Error('soundcloud-ytdlp: ' + errs.join(' | '));
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +785,7 @@ function combineAudioThumb(audioBuf, thumbBuf, audioMime) {
 
 async function downloadVideoAsAudioThumb(query, videoId) {
   // 1. Get audio via SoundCloud (same path that powers .play — works on Railway)
-  const audio = await downloadWithSoundCloud(query);
+  const audio = await downloadWithSoundCloudYtdlp(query).catch(() => downloadWithSoundCloud(query));
 
   // 2. Get YouTube thumbnail (maxresdefault → hqdefault fallback)
   let thumbBuf;
@@ -768,21 +839,26 @@ async function downloadVideo(query, videoUrl, videoId) {
 async function downloadAudio(query, videoUrl) {
   const errs = [];
 
-  // 1. SoundCloud — cloud-IP friendly, doesn't throttle like YouTube, works on Railway
+  // 1. SoundCloud search → yt-dlp: most reliable on Railway.
+  //    SC search works fine from cloud IPs; yt-dlp handles SC HLS streams internally.
+  try { return await downloadWithSoundCloudYtdlp(query); }
+  catch (e) { errs.push('sc-ytdlp: ' + (e.message || '').slice(0, 120)); }
+
+  // 2. yt-dlp direct YouTube — installed via pip, tries ios/tv_embedded clients
+  try { return await downloadWithYtdlp(videoUrl); }
+  catch (e) { errs.push('yt-dlp: ' + (e.message || '').slice(0, 150)); }
+
+  // 3. SoundCloud direct stream (progressive — may 404 from some cloud IPs)
   try { return await downloadWithSoundCloud(query); }
   catch (e) { errs.push('soundcloud: ' + (e.message || '').slice(0, 100)); }
 
-  // 2. Invidious proxy — video-ID based, bypasses YouTube CDN IP block
+  // 4. Invidious proxy
   try { return await downloadWithInvidious(videoUrl); }
   catch (e) { errs.push('invidious: ' + (e.message || '').slice(0, 100)); }
 
-  // 3. Cobalt
+  // 5. Cobalt
   try { return await downloadWithCobalt(videoUrl); }
   catch (e) { errs.push('cobalt: ' + (e.message || '').slice(0, 100)); }
-
-  // 4. yt-dlp — last resort (Railway IPs are often blocked by YouTube; may be slow)
-  try { return await downloadWithYtdlp(videoUrl); }
-  catch (e) { errs.push('yt-dlp: ' + (e.message || '').slice(0, 150)); }
 
   throw new Error(errs.join('\n'));
 }
