@@ -14,8 +14,14 @@ process.on('unhandledRejection', (e) => logger.error({ err: e?.stack || e?.messa
 // container can restore them.
 async function gracefulExit(signal) {
   logger.info(`Received ${signal} — flushing session backup before exit.`);
-  try { await sessionBackup.flush(); } catch (_) {}
-  process.exit(0);
+  try {
+    // Cap at 8s so a slow GitHub API never blocks Railway's SIGTERM window
+    await Promise.race([
+      sessionBackup.flush(),
+      new Promise(resolve => setTimeout(resolve, 8000)),
+    ]);
+  } catch (_) {}
+  process.exit(0); // 0 is correct here — Railway is already redeploying, not restarting
 }
 process.on('SIGTERM', () => gracefulExit('SIGTERM'));
 process.on('SIGINT',  () => gracefulExit('SIGINT'));

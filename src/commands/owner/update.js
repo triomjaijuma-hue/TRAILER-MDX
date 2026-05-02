@@ -28,10 +28,27 @@ const sessionBackup = require('../../lib/sessionBackup');
 // GitHub first. Without this, .update / .restart / .redeploy on a host
 // without persistent storage would lose the very session change that just
 // happened in the last 30 seconds.
+//
+// Two bugs fixed:
+//   1. sessionBackup.flush() could hang indefinitely if GitHub API is slow,
+//      leaving the process frozen and never calling process.exit(). Now capped
+//      at 8 seconds — if the push doesn't finish in time, we exit anyway.
+//   2. process.exit(0) (clean exit) can be treated as "completed normally" by
+//      Railway and NOT trigger the ALWAYS restart policy. Using exit code 1
+//      guarantees Railway always restarts the service.
 async function exitAfterFlush(code, ms) {
   setTimeout(async () => {
-    try { await sessionBackup.flush(); } catch (_) {}
-    process.exit(code);
+    try {
+      // Hard 8-second cap — flush must not block the restart indefinitely
+      await Promise.race([
+        sessionBackup.flush(),
+        new Promise(resolve => setTimeout(resolve, 8000)),
+      ]);
+    } catch (_) {}
+    // Exit with 1 so Railway's ALWAYS restart policy reliably triggers.
+    // Exit code 0 ("normal completion") is sometimes treated as "done" by
+    // Railway and skipped by the restart policy even when set to ALWAYS.
+    process.exit(1);
   }, ms);
 }
 
